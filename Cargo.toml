@@ -1,5 +1,5 @@
 [workspace]
-members = ["middlesox", "hyprland", "mangowc", "socket", "daemon", "cli"]
+members = ["middlesox", "hyprland", "mangowc", "socket", "middlesox-cli"]
 resolver = "2"
 
 [workspace.package]
@@ -40,3 +40,4 @@ clap = { version = "4", features = ["derive"] }
 
 # Utilities
 dirs = "6"
+libc = "0.2"

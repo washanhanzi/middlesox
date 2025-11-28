@@ -210,6 +210,24 @@ impl ScriptEngine {
     pub fn manifest(&self) -> &CapabilityManifest {
         &self.manifest
     }
+
+    /// Get a value from the backend.
+    pub async fn get(&self, key: &str) -> Result<Value> {
+        let adapter = self.adapter.read().await;
+        adapter.get(key).await
+    }
+
+    /// Set a value in the backend.
+    pub async fn set(&self, key: &str, value: Value) -> Result<()> {
+        let adapter = self.adapter.read().await;
+        adapter.set(key, value).await
+    }
+
+    /// Get the adapter name.
+    pub async fn adapter_name(&self) -> String {
+        let adapter = self.adapter.read().await;
+        adapter.name().to_string()
+    }
 }
 
 /// Convert a serde_json::Value to a Rhai Dynamic.

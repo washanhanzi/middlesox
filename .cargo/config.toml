@@ -1,0 +1,6 @@
+# Local development configuration
+# Enable mock backend by default for development/testing
+
+[alias]
+dev = "run -p middlesox --features mock"
+dev-test = "test -p middlesox --features mock"

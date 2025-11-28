@@ -1,0 +1,42 @@
+[workspace]
+members = ["middlesox", "hyprland", "mangowc", "socket", "daemon", "cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# The base crate
+middlesox = { path = "middlesox" }
+middlesox-socket = { path = "socket" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+# Concurrent state
+dashmap = "6"
+
+# Scripting
+rhai = { version = "1", features = ["sync"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+dirs = "6"

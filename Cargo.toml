@@ -1,5 +1,5 @@
 [workspace]
-members = ["middlesox", "hyprland", "mangowc", "socket", "middlesox-cli"]
+members = ["middlesox", "hyprland", "mangowc", "socket", "middlesox-cli", "middlesox-tests"]
 resolver = "2"
 
 [workspace.package]
@@ -41,3 +41,6 @@ clap = { version = "4", features = ["derive"] }
 # Utilities
 dirs = "6"
 libc = "0.2"
+
+# Testing
+tempfile = "3"

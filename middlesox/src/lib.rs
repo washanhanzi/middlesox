@@ -29,6 +29,7 @@ mod event;
 mod mock;
 
 pub mod config;
+pub mod control;
 pub mod engine;
 
 // Core protocol types

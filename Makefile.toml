@@ -1,0 +1,11 @@
+[config]
+default_to_workspace = false
+
+[tasks.dev]
+description = "Build middlesox-cli and install to ~/.local/bin"
+script = '''
+cargo build --release -p middlesox-cli
+mkdir -p ~/.local/bin
+cp target/release/msx ~/.local/bin/
+echo "Installed msx to ~/.local/bin/msx"
+'''

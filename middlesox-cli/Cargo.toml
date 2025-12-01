@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 middlesox.workspace = true
 middlesox-socket.workspace = true
+middlesox-mangowc.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

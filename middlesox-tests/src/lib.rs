@@ -52,7 +52,6 @@ impl TestHarness {
             },
             adapter: AdapterConfig::Mock,
             watch: vec![],
-            watch_with_script: vec![],
             command: vec![],
         };
 
@@ -220,16 +219,17 @@ impl Controller {
         let prev = event.prev.clone().unwrap_or_default();
         let curr = event.curr.clone().unwrap_or_default();
 
+        // Process watches
         for watch in self.config.watches_for_event(&event.name) {
-            if watch.matches(&prev, &curr) {
-                info!("Watch matched: {} -> {}", event.name, watch.exec);
+            // If no conditions specified, always run (script handles logic)
+            // If conditions specified, check match first
+            let should_run = watch.prev.is_empty() && watch.curr.is_empty()
+                || watch.matches(&prev, &curr);
+
+            if should_run {
+                info!("Watch triggered: {} -> {}", event.name, watch.exec);
                 self.run_script(&watch.exec, &event).await;
             }
-        }
-
-        for sw in self.config.script_watches_for_event(&event.name) {
-            debug!("Running script watch: {} -> {}", event.name, sw.script);
-            self.run_script(&sw.script, &event).await;
         }
     }
 

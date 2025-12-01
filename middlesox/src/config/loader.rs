@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use tracing::debug;
 
 /// Root configuration structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,13 +21,11 @@ pub struct Config {
     #[serde(default)]
     pub adapter: AdapterConfig,
 
-    /// Simple declarative watches: match event + prev/curr, execute script
+    /// Event watches: match event + optional prev/curr conditions, execute script
+    /// If prev/curr are empty, script runs for every matching event (script handles logic).
+    /// If prev/curr have conditions, declarative matching is applied first.
     #[serde(default)]
     pub watch: Vec<Watch>,
-
-    /// Scriptable watches: script handles matching and action
-    #[serde(default)]
-    pub watch_with_script: Vec<WatchWithScript>,
 
     /// Named reusable commands
     #[serde(default)]
@@ -136,7 +135,11 @@ impl SocketAdapterConfig {
 }
 
 fn default_scripts_dir() -> String {
-    "scripts".into()
+    dirs::config_dir()
+        .map(|p| p.join("middlesox/scripts"))
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config/middlesox/scripts"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn default_log_level() -> String {
@@ -172,26 +175,6 @@ pub struct Watch {
     /// Optional: match only if current state matches these values
     #[serde(default)]
     pub curr: HashMap<String, Value>,
-
-    /// Optional: human-readable description
-    pub description: Option<String>,
-
-    /// Whether the watch is enabled
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-}
-
-/// A scriptable watch.
-///
-/// The script handles both matching and action logic.
-/// Receives full event context (prev, curr, event_name).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatchWithScript {
-    /// Event name to subscribe to
-    pub event: String,
-
-    /// Script file that handles matching and action (relative to scripts_dir)
-    pub script: String,
 
     /// Optional: human-readable description
     pub description: Option<String>,
@@ -243,14 +226,6 @@ impl Config {
             .collect()
     }
 
-    /// Get enabled script watches for a specific event.
-    pub fn script_watches_for_event(&self, event_name: &str) -> Vec<&WatchWithScript> {
-        self.watch_with_script
-            .iter()
-            .filter(|w| w.enabled && w.event == event_name)
-            .collect()
-    }
-
     /// Get a command by name.
     pub fn command_by_name(&self, name: &str) -> Option<&Command> {
         self.command.iter().find(|c| c.name == name)
@@ -260,23 +235,11 @@ impl Config {
     ///
     /// This is used to tell backends which events to subscribe to.
     pub fn subscribed_events(&self) -> HashSet<String> {
-        let mut events = HashSet::new();
-
-        // Collect from watches
-        for w in &self.watch {
-            if w.enabled {
-                events.insert(w.event.clone());
-            }
-        }
-
-        // Collect from script watches
-        for w in &self.watch_with_script {
-            if w.enabled {
-                events.insert(w.event.clone());
-            }
-        }
-
-        events
+        self.watch
+            .iter()
+            .filter(|w| w.enabled)
+            .map(|w| w.event.clone())
+            .collect()
     }
 
     /// Create a default configuration.
@@ -284,11 +247,12 @@ impl Config {
         Self {
             settings: Settings::default(),
             adapter: AdapterConfig::default(),
-            watch: vec![],
-            watch_with_script: vec![
-                WatchWithScript {
+            watch: vec![
+                Watch {
                     event: "workspace_change".into(),
-                    script: "on_workspace_change.rhai".into(),
+                    exec: "on_workspace_change.rhai".into(),
+                    prev: HashMap::new(),
+                    curr: HashMap::new(),
                     description: Some("Called when workspace changes".into()),
                     enabled: true,
                 },
@@ -301,22 +265,53 @@ impl Config {
 impl Watch {
     /// Check if this watch matches the given transition states.
     pub fn matches(&self, prev_state: &HashMap<String, Value>, curr_state: &HashMap<String, Value>) -> bool {
+        debug!(
+            event = %self.event,
+            exec = %self.exec,
+            prev_conditions = ?self.prev,
+            curr_conditions = ?self.curr,
+            prev_state = ?prev_state,
+            curr_state = ?curr_state,
+            "Checking watch match"
+        );
+
         // Check all prev conditions
         for (key, expected) in &self.prev {
             match prev_state.get(key) {
-                Some(actual) if actual == expected => continue,
-                _ => return false,
+                Some(actual) if actual == expected => {
+                    debug!(key = %key, expected = ?expected, "prev condition matched");
+                    continue;
+                }
+                Some(actual) => {
+                    debug!(key = %key, expected = ?expected, actual = ?actual, "prev condition failed: value mismatch");
+                    return false;
+                }
+                None => {
+                    debug!(key = %key, expected = ?expected, "prev condition failed: key not found");
+                    return false;
+                }
             }
         }
 
         // Check all curr conditions
         for (key, expected) in &self.curr {
             match curr_state.get(key) {
-                Some(actual) if actual == expected => continue,
-                _ => return false,
+                Some(actual) if actual == expected => {
+                    debug!(key = %key, expected = ?expected, "curr condition matched");
+                    continue;
+                }
+                Some(actual) => {
+                    debug!(key = %key, expected = ?expected, actual = ?actual, "curr condition failed: value mismatch");
+                    return false;
+                }
+                None => {
+                    debug!(key = %key, expected = ?expected, "curr condition failed: key not found");
+                    return false;
+                }
             }
         }
 
+        debug!(event = %self.event, exec = %self.exec, "Watch matched");
         true
     }
 }
@@ -345,9 +340,10 @@ id = 1
 [watch.curr]
 id = 2
 
-[[watch_with_script]]
+# Script watch (no conditions)
+[[watch]]
 event = "layout_change"
-script = "smart_layout.rhai"
+exec = "smart_layout.rhai"
 
 [[command]]
 name = "toggle_layout"
@@ -357,10 +353,11 @@ script = "toggle_layout.rhai"
         let config = Config::parse(toml).unwrap();
         assert!(matches!(config.adapter, AdapterConfig::Mock));
         assert_eq!(config.adapter.name(), "mock");
-        assert_eq!(config.watch.len(), 1);
+        assert_eq!(config.watch.len(), 2);
         assert_eq!(config.watch[0].event, "workspace_change");
         assert_eq!(config.watch[0].prev.get("id"), Some(&Value::from(1)));
-        assert_eq!(config.watch_with_script.len(), 1);
+        assert_eq!(config.watch[1].event, "layout_change");
+        assert!(config.watch[1].prev.is_empty()); // No conditions = script watch
         assert_eq!(config.command.len(), 1);
         assert_eq!(config.command[0].name, "toggle_layout");
     }
@@ -445,13 +442,13 @@ name = "hyprland"
 event = "workspace_change"
 exec = "test.rhai"
 
-[[watch_with_script]]
+[[watch]]
 event = "focus_change"
-script = "focus.rhai"
+exec = "focus.rhai"
 
-[[watch_with_script]]
+[[watch]]
 event = "workspace_change"
-script = "ws.rhai"
+exec = "ws.rhai"
 "#;
 
         let config = Config::parse(toml).unwrap();

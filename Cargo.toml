@@ -1,9 +1,16 @@
 [workspace]
-members = ["middlesox", "hyprland", "mangowc", "socket", "middlesox-cli", "middlesox-tests"]
+members = [
+    "middlesox",
+    "hyprland",
+    "mangowc",
+    "socket",
+    "middlesox-cli",
+    "middlesox-tests",
+]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "MIT"
 
@@ -11,6 +18,7 @@ license = "MIT"
 # The base crate
 middlesox = { path = "middlesox" }
 middlesox-socket = { path = "socket" }
+middlesox-mangowc = { path = "mangowc" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

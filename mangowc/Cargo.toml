@@ -13,6 +13,10 @@ serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
-# Wayland client (uncomment when implementing)
-# wayland-client = "0.31"
-# wayland-protocols = { version = "0.31", features = ["client"] }
+# Wayland client
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+libc = "0.2"

@@ -103,7 +103,6 @@ enum Commands {
 
 fn find_config_path() -> Option<PathBuf> {
     let candidates = [
-        PathBuf::from("middlesox.toml"),
         dirs::config_dir()
             .map(|p| p.join("middlesox/config.toml"))
             .unwrap_or_default(),
@@ -153,7 +152,7 @@ fn create_backend_from_config(adapter: &middlesox::config::AdapterConfig) -> Res
             Err(anyhow!("Hyprland adapter not yet implemented"))
         }
         AdapterConfig::Mangowc => {
-            Err(anyhow!("MangoWC adapter not yet implemented"))
+            middlesox_mangowc::create_backend()
         }
         AdapterConfig::Socket(socket_cfg) => {
             let (cmd_socket, event_socket) = socket_cfg.socket_paths();
@@ -197,35 +196,101 @@ impl Controller {
         let prev = event.prev.clone().unwrap_or_default();
         let curr = event.curr.clone().unwrap_or_default();
 
-        // Process declarative watches
+        // Process watches
         for watch in self.config.watches_for_event(&event.name) {
-            if watch.matches(&prev, &curr) {
-                info!("Watch matched: {} -> {}", event.name, watch.exec);
+            // If no conditions specified, always run (script handles logic)
+            // If conditions specified, check match first
+            let should_run = watch.prev.is_empty() && watch.curr.is_empty()
+                || watch.matches(&prev, &curr);
+
+            if should_run {
+                info!("Watch triggered: {} -> {}", event.name, watch.exec);
                 self.run_script(&watch.exec, &event).await;
             }
-        }
-
-        // Process script watches
-        for sw in self.config.script_watches_for_event(&event.name) {
-            debug!("Running script watch: {} -> {}", event.name, sw.script);
-            self.run_script(&sw.script, &event).await;
         }
     }
 
     async fn run_script(&self, script_name: &str, event: &RawEvent) {
-        let script_path = self.scripts_dir.join(script_name);
+        let script_path = if std::path::Path::new(script_name).is_absolute() {
+            PathBuf::from(script_name)
+        } else {
+            self.scripts_dir.join(script_name)
+        };
         if !script_path.exists() {
             warn!("Script not found: {}", script_path.display());
             return;
         }
 
-        match self.engine.execute_file_with_event(&script_path, event).await {
-            Ok(result) => {
-                debug!("Script '{}' returned: {:?}", script_name, result);
+        // Check if it's a Rhai script or a shell command
+        if script_path.extension().map_or(false, |ext| ext == "rhai") {
+            // Execute as Rhai script
+            match self.engine.execute_file_with_event(&script_path, event).await {
+                Ok(result) => {
+                    debug!("Script '{}' returned: {:?}", script_name, result);
+                }
+                Err(e) => {
+                    error!("Script '{}' failed: {}", script_name, e);
+                }
             }
-            Err(e) => {
-                error!("Script '{}' failed: {}", script_name, e);
+        } else {
+            // Execute as shell command in a spawned task
+            debug!("Spawning command: {}", script_path.display());
+
+            // Validate shebang for .sh files
+            if script_path.extension().map_or(false, |ext| ext == "sh") {
+                match std::fs::read(&script_path) {
+                    Ok(content) => {
+                        if !content.starts_with(b"#!") {
+                            error!(
+                                "Script '{}' is missing a shebang line (e.g., #!/bin/bash). \
+                                 This will cause 'Exec format error' on execution.",
+                                script_path.display()
+                            );
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to read script '{}': {}", script_path.display(), e);
+                        return;
+                    }
+                }
             }
+
+            let event_name = event.name.clone();
+            let prev_json = serde_json::to_string(&event.prev).unwrap_or_default();
+            let curr_json = serde_json::to_string(&event.curr).unwrap_or_default();
+            let script_name = script_name.to_string();
+
+            tokio::spawn(async move {
+                let result = tokio::process::Command::new(&script_path)
+                    .env("MSX_EVENT", &event_name)
+                    .env("MSX_PREV", &prev_json)
+                    .env("MSX_CURR", &curr_json)
+                    .output()
+                    .await;
+
+                match result {
+                    Ok(output) => {
+                        if output.status.success() {
+                            debug!("Command '{}' completed successfully", script_name);
+                            if !output.stdout.is_empty() {
+                                debug!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+                            }
+                        } else {
+                            error!(
+                                "Command '{}' failed with status: {}",
+                                script_name, output.status
+                            );
+                            if !output.stderr.is_empty() {
+                                error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to execute command '{}': {}", script_name, e);
+                    }
+                }
+            });
         }
     }
 
@@ -365,6 +430,8 @@ async fn run_daemon(config: Config) -> Result<()> {
 
     // Spawn event listener (backend -> daemon)
     let (event_tx, mut event_rx) = mpsc::channel::<RawEvent>(100);
+    let listener_backend = Arc::new(listener_backend);
+    let listener_backend_for_shutdown = listener_backend.clone();
     let listener_handle = tokio::spawn(async move {
         if let Err(e) = listener_backend.listen(event_tx, subscriptions).await {
             error!("Backend listener error: {}", e);
@@ -401,13 +468,30 @@ async fn run_daemon(config: Config) -> Result<()> {
 
     info!("Shutting down...");
 
+    // Signal the backend to stop its event loop
+    debug!("Calling backend shutdown()...");
+    if let Err(e) = listener_backend_for_shutdown.shutdown().await {
+        warn!("Backend shutdown error: {}", e);
+    }
+    debug!("Backend shutdown() returned");
+
+    // Give the listener task a moment to exit cleanly
+    debug!("Waiting for listener task to exit...");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    debug!("Wait complete, aborting tasks...");
+
     // Cleanup
     listener_handle.abort();
+    debug!("listener_handle aborted");
     event_handle.abort();
+    debug!("event_handle aborted");
     control_handle.abort();
+    debug!("control_handle aborted");
     control::cleanup_socket();
+    debug!("Socket cleaned up");
 
     info!("Middlesox stopped");
+    debug!("Returning from run_daemon()");
     Ok(())
 }
 

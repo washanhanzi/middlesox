@@ -2,8 +2,6 @@
 # Universal Window Manager Controller
 
 [settings]
-# Backend to use: "mock", "mangowc", "hyprland" (future)
-backend = "mock"
 
 # Directory containing Rhai scripts (relative to config file)
 scripts_dir = "scripts"
@@ -11,37 +9,32 @@ scripts_dir = "scripts"
 # Log level: "trace", "debug", "info", "warn", "error"
 log_level = "info"
 
+[adapter]
+name = "mangowc"
+
 # ============================================================
 # Watches: React to compositor events
 # ============================================================
 
-# Simple watch: declarative matching with prev/curr conditions
+# Declarative watch: matching with prev/curr conditions
 # When matched, executes the script with event context (prev, curr, event_name)
 [[watch]]
 event = "workspace_change"
 exec = "toggle_layout.rhai"
 description = "Toggle layout when switching from workspace 1 to 2"
+prev = { id = 1 }
+curr = { id = 2 }
 
-[watch.prev]
-id = 1
-
-[watch.curr]
-id = 2
-
-# ============================================================
-# Script Watches: Script handles matching and action
-# ============================================================
-
-# Script watch: script receives full event context and handles logic
-# Use this for complex conditions that can't be expressed declaratively
-[[watch_with_script]]
+# Script watch: no conditions, script handles all matching logic
+# Use for complex conditions that can't be expressed declaratively
+[[watch]]
 event = "workspace_change"
-script = "on_workspace_change.rhai"
+exec = "on_workspace_change.rhai"
 description = "Custom workspace change logic"
 
-[[watch_with_script]]
+[[watch]]
 event = "window_update"
-script = "on_window_update.rhai"
+exec = "on_window_update.rhai"
 description = "React when window count changes"
 
 # ============================================================

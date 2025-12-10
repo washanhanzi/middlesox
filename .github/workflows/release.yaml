@@ -1,0 +1,68 @@
+name: Release
+
+on:
+    push:
+        branches:
+            - release
+
+permissions:
+    contents: write
+
+jobs:
+    release:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Get version from Cargo.toml
+              id: version
+              run: |
+                  VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+                  echo "version=$VERSION" >> $GITHUB_OUTPUT
+                  echo "Version: $VERSION"
+
+            - name: Check if tag exists
+              id: tag_check
+              run: |
+                  if git ls-remote --tags origin | grep -q "refs/tags/v${{ steps.version.outputs.version }}"; then
+                    echo "exists=true" >> $GITHUB_OUTPUT
+                  else
+                    echo "exists=false" >> $GITHUB_OUTPUT
+                  fi
+
+            - name: Install Rust toolchain
+              if: steps.tag_check.outputs.exists == 'false'
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Build release binary
+              if: steps.tag_check.outputs.exists == 'false'
+              run: cargo build --release
+
+            - name: Package binary
+              if: steps.tag_check.outputs.exists == 'false'
+              run: |
+                  mkdir -p dist
+                  cp target/release/msx dist/
+                  cd dist
+                  tar -czvf msx-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz msx
+                  sha256sum msx-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz > msx-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz.sha256
+
+            - name: Create tag
+              if: steps.tag_check.outputs.exists == 'false'
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
+                  git push origin "v${{ steps.version.outputs.version }}"
+
+            - name: Create GitHub Release
+              if: steps.tag_check.outputs.exists == 'false'
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: v${{ steps.version.outputs.version }}
+                  name: v${{ steps.version.outputs.version }}
+                  files: |
+                      dist/msx-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz
+                      dist/msx-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz.sha256
+                  generate_release_notes: true

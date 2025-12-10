@@ -24,7 +24,7 @@ Universal Window Manager Controller - scriptable event-driven automation for any
 ## Configuration
 
 Config file is loaded from (first match wins):
-1. `./middlesox.toml`
+1. `./middlesox.toml` (current directory)
 2. `~/.config/middlesox/config.toml`
 3. `/etc/middlesox/config.toml`
 
@@ -56,14 +56,14 @@ prev = { id = 1 }
 curr = { id = 2 }
 
 # Scriptable watch: script handles both matching and action
-[[watch_with_script]]
+[[watch]]
 event = "workspace_change"
-script = "on_workspace_change.rhaij"
+exec = "on_workspace_change.rhai"
 description = "Custom workspace change handler"
 
-[[watch_with_script]]
+[[watch]]
 event = "focus_change"
-script = "on_focus.rhai"
+exec = "on_focus.rhai"
 
 # Named commands (invoked via `msx exec <name>`)
 [[command]]
@@ -107,23 +107,30 @@ if current == "master" {
 }
 ```
 
-**Shell scripts / executables** (any other extension) spawn as a subprocess with event context in environment variables:
+**Shell scripts / executables** (any other extension) spawn as a subprocess with event context available via:
+
+1. **Positional argument** (`$1`): Full JSON payload
+2. **Environment variables**: `MSX_EVENT`, `MSX_PREV`, `MSX_CURR`
+
 ```bash
 #!/bin/bash
 # ~/.config/middlesox/scripts/wallpaper.sh
-echo "Event: $MSX_EVENT"      # e.g., "workspace_change"
-echo "Prev: $MSX_PREV"        # JSON: {"id": 1}
-echo "Curr: $MSX_CURR"        # JSON: {"id": 2}
+
+# Option 1: Parse the JSON argument
+payload="$1"
+echo "Event: $(echo "$payload" | jq -r '.event')"      # e.g., "workspace_change"
+echo "Prev:  $(echo "$payload" | jq -c '.prev')"       # JSON: {"id": 1}
+echo "Curr:  $(echo "$payload" | jq -c '.curr')"       # JSON: {"id": 2}
+
+# Option 2: Use environment variables (simpler for many cases)
+echo "Event: $MSX_EVENT"                               # e.g., "workspace_change"
+echo "Prev:  $MSX_PREV"                                # JSON: {"id": 1}
+echo "Curr:  $MSX_CURR"                                # JSON: {"id": 2}
 
 # Change wallpaper based on workspace
 id=$(echo "$MSX_CURR" | jq -r '.id')
 feh --bg-fill ~/wallpapers/workspace-$id.jpg
 ```
-
-Environment variables for shell scripts:
-- `MSX_EVENT` - event name (e.g., `workspace_change`, `focus_change`)
-- `MSX_PREV` - previous state as JSON
-- `MSX_CURR` - current state as JSON
 
 ## CLI
 

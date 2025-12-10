@@ -103,13 +103,27 @@ enum Commands {
 
 fn find_config_path() -> Option<PathBuf> {
     let candidates = [
+        // Local directory config (highest priority)
+        PathBuf::from("./middlesox.toml"),
+        // User config
         dirs::config_dir()
             .map(|p| p.join("middlesox/config.toml"))
             .unwrap_or_default(),
+        // System config
         PathBuf::from("/etc/middlesox/config.toml"),
     ];
 
     candidates.into_iter().find(|p| p.exists())
+}
+
+/// Expand path with tilde expansion.
+fn expand_path(path: &str) -> PathBuf {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(&path[2..]);
+        }
+    }
+    PathBuf::from(path)
 }
 
 fn parse_value(s: &str) -> Value {
@@ -211,11 +225,7 @@ impl Controller {
     }
 
     async fn run_script(&self, script_name: &str, event: &RawEvent) {
-        let script_path = if std::path::Path::new(script_name).is_absolute() {
-            PathBuf::from(script_name)
-        } else {
-            self.scripts_dir.join(script_name)
-        };
+        let script_path = self.resolve_script_path(script_name);
         if !script_path.exists() {
             warn!("Script not found: {}", script_path.display());
             return;
@@ -233,64 +243,188 @@ impl Controller {
                 }
             }
         } else {
-            // Execute as shell command in a spawned task
-            debug!("Spawning command: {}", script_path.display());
+            // Execute as shell command
+            self.run_shell_script(&script_path, script_name, Some(event)).await;
+        }
+    }
 
-            // Validate shebang for .sh files
-            if script_path.extension().map_or(false, |ext| ext == "sh") {
-                match std::fs::read(&script_path) {
-                    Ok(content) => {
-                        if !content.starts_with(b"#!") {
-                            error!(
-                                "Script '{}' is missing a shebang line (e.g., #!/bin/bash). \
-                                 This will cause 'Exec format error' on execution.",
-                                script_path.display()
-                            );
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to read script '{}': {}", script_path.display(), e);
+    /// Resolve a script path, supporting both absolute paths and relative paths.
+    fn resolve_script_path(&self, script_name: &str) -> PathBuf {
+        if std::path::Path::new(script_name).is_absolute() {
+            PathBuf::from(script_name)
+        } else {
+            self.scripts_dir.join(script_name)
+        }
+    }
+
+    /// Run a shell script with optional event context.
+    async fn run_shell_script(&self, script_path: &PathBuf, script_name: &str, event: Option<&RawEvent>) {
+        debug!("Spawning command: {}", script_path.display());
+
+        // Validate shebang for .sh files
+        if script_path.extension().map_or(false, |ext| ext == "sh") {
+            match std::fs::read(script_path) {
+                Ok(content) => {
+                    if !content.starts_with(b"#!") {
+                        error!(
+                            "Script '{}' is missing a shebang line (e.g., #!/bin/bash). \
+                             This will cause 'Exec format error' on execution.",
+                            script_path.display()
+                        );
                         return;
                     }
                 }
+                Err(e) => {
+                    error!("Failed to read script '{}': {}", script_path.display(), e);
+                    return;
+                }
             }
+        }
 
-            let event_name = event.name.clone();
-            let prev_json = serde_json::to_string(&event.prev).unwrap_or_default();
-            let curr_json = serde_json::to_string(&event.curr).unwrap_or_default();
-            let script_name = script_name.to_string();
+        let script_name = script_name.to_string();
+        let script_path = script_path.clone();
 
-            tokio::spawn(async move {
-                let result = tokio::process::Command::new(&script_path)
-                    .env("MSX_EVENT", &event_name)
-                    .env("MSX_PREV", &prev_json)
-                    .env("MSX_CURR", &curr_json)
-                    .output()
-                    .await;
+        // Build environment variables and JSON input
+        let (input_json, env_event, env_prev, env_curr) = if let Some(event) = event {
+            let input_json = serde_json::json!({
+                "event": &event.name,
+                "prev": &event.prev,
+                "curr": &event.curr,
+            })
+            .to_string();
+            let env_event = event.name.clone();
+            let env_prev = serde_json::to_string(&event.prev).unwrap_or_default();
+            let env_curr = serde_json::to_string(&event.curr).unwrap_or_default();
+            (input_json, env_event, env_prev, env_curr)
+        } else {
+            // No event context - command invocation
+            let input_json = serde_json::json!({
+                "event": "command",
+                "prev": null,
+                "curr": null,
+            })
+            .to_string();
+            ("command".to_string(), "null".to_string(), "null".to_string());
+            (input_json, "command".to_string(), "null".to_string(), "null".to_string())
+        };
 
-                match result {
-                    Ok(output) => {
-                        if output.status.success() {
-                            debug!("Command '{}' completed successfully", script_name);
-                            if !output.stdout.is_empty() {
-                                debug!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-                            }
-                        } else {
-                            error!(
-                                "Command '{}' failed with status: {}",
-                                script_name, output.status
-                            );
-                            if !output.stderr.is_empty() {
-                                error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-                            }
+        tokio::spawn(async move {
+            let result = tokio::process::Command::new(&script_path)
+                .arg(&input_json)
+                // Set environment variables for shell scripts
+                .env("MSX_EVENT", &env_event)
+                .env("MSX_PREV", &env_prev)
+                .env("MSX_CURR", &env_curr)
+                .output()
+                .await;
+
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        debug!("Command '{}' completed successfully", script_name);
+                        if !output.stdout.is_empty() {
+                            debug!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+                        }
+                    } else {
+                        error!(
+                            "Command '{}' failed with status: {}",
+                            script_name, output.status
+                        );
+                        if !output.stderr.is_empty() {
+                            error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to execute command '{}': {}", script_name, e);
+                }
+                Err(e) => {
+                    error!("Failed to execute command '{}': {}", script_name, e);
+                }
+            }
+        });
+    }
+
+    /// Execute a script synchronously and return the result.
+    /// Used by msx exec command.
+    async fn execute_script(&self, script_name: &str) -> Result<Option<String>, String> {
+        let script_path = self.resolve_script_path(script_name);
+        if !script_path.exists() {
+            return Err(format!("Script not found: {}", script_path.display()));
+        }
+
+        // Check if it's a Rhai script or a shell command
+        if script_path.extension().map_or(false, |ext| ext == "rhai") {
+            // Execute as Rhai script
+            match self.engine.execute_file(&script_path).await {
+                Ok(result) => {
+                    if result.is_unit() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(format!("{:?}", result)))
                     }
                 }
-            });
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            // Execute as shell command synchronously
+            self.execute_shell_script(&script_path, script_name).await
+        }
+    }
+
+    /// Execute a shell script synchronously and return the result.
+    async fn execute_shell_script(&self, script_path: &PathBuf, script_name: &str) -> Result<Option<String>, String> {
+        debug!("Executing command: {}", script_path.display());
+
+        // Validate shebang for .sh files
+        if script_path.extension().map_or(false, |ext| ext == "sh") {
+            match std::fs::read(script_path) {
+                Ok(content) => {
+                    if !content.starts_with(b"#!") {
+                        return Err(format!(
+                            "Script '{}' is missing a shebang line (e.g., #!/bin/bash)",
+                            script_path.display()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Failed to read script '{}': {}", script_path.display(), e));
+                }
+            }
+        }
+
+        // No event context for command invocation
+        let input_json = serde_json::json!({
+            "event": "command",
+            "prev": null,
+            "curr": null,
+        })
+        .to_string();
+
+        let result = tokio::process::Command::new(script_path)
+            .arg(&input_json)
+            .env("MSX_EVENT", "command")
+            .env("MSX_PREV", "null")
+            .env("MSX_CURR", "null")
+            .output()
+            .await;
+
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    debug!("Command '{}' completed successfully", script_name);
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    if stdout.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(stdout))
+                    }
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    Err(format!(
+                        "Command '{}' failed with status {}: {}",
+                        script_name, output.status, stderr
+                    ))
+                }
+            }
+            Err(e) => Err(format!("Failed to execute command '{}': {}", script_name, e)),
         }
     }
 
@@ -313,23 +447,11 @@ impl Controller {
                     None => return ControlResponse::err(format!("Unknown command: {}", name)),
                 };
 
-                let script_path = self.scripts_dir.join(&cmd.script);
-                if !script_path.exists() {
-                    return ControlResponse::err(format!(
-                        "Script not found: {}",
-                        script_path.display()
-                    ));
-                }
-
-                match self.engine.execute_file(&script_path).await {
-                    Ok(result) => {
-                        if result.is_unit() {
-                            ControlResponse::ok_empty()
-                        } else {
-                            ControlResponse::ok(serde_json::json!(format!("{:?}", result)))
-                        }
-                    }
-                    Err(e) => ControlResponse::err(e.to_string()),
+                // Use execute_script which supports both Rhai and shell scripts
+                match self.execute_script(&cmd.script).await {
+                    Ok(None) => ControlResponse::ok_empty(),
+                    Ok(Some(output)) => ControlResponse::ok(serde_json::json!(output)),
+                    Err(e) => ControlResponse::err(e),
                 }
             }
 
@@ -396,6 +518,14 @@ async fn run_daemon(config: Config) -> Result<()> {
     let backend = create_backend_from_config(&config.adapter)?;
     info!("Adapter initialized: {}", backend.name());
 
+    // For socket adapters, trigger capability fetch before creating engine
+    // by doing a dummy get (capabilities are lazily fetched on first operation)
+    if matches!(config.adapter, middlesox::config::AdapterConfig::Socket(_)) {
+        debug!("Triggering capability fetch for socket adapter...");
+        // Ignore error - this just primes the capability cache
+        let _ = backend.get("__caps_prime__").await;
+    }
+
     // Show capabilities
     let manifest = backend.manifest();
     info!("Capabilities ({}):", manifest.len());
@@ -408,13 +538,17 @@ async fn run_daemon(config: Config) -> Result<()> {
         );
     }
 
-    let scripts_dir = PathBuf::from(&config.settings.scripts_dir);
+    let scripts_dir = expand_path(&config.settings.scripts_dir);
     if !scripts_dir.exists() {
         warn!("Scripts directory not found: {}", scripts_dir.display());
     }
 
+    // Create engine with the backend - it will be shared for event listening
     let engine = ScriptEngine::new(backend);
-    let listener_backend = create_backend_from_config(&config.adapter)?;
+
+    // Get the shared adapter for the event listener (same instance as engine uses)
+    let shared_adapter = engine.shared_adapter();
+
     let subscriptions = config.subscribed_events();
     info!("Subscribed events: {:?}", subscriptions);
 
@@ -428,12 +562,13 @@ async fn run_daemon(config: Config) -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
 
-    // Spawn event listener (backend -> daemon)
+    // Spawn event listener (backend -> daemon) using the shared adapter
     let (event_tx, mut event_rx) = mpsc::channel::<RawEvent>(100);
-    let listener_backend = Arc::new(listener_backend);
-    let listener_backend_for_shutdown = listener_backend.clone();
+    let listener_adapter = shared_adapter.clone();
+    let listener_adapter_for_shutdown = shared_adapter.clone();
     let listener_handle = tokio::spawn(async move {
-        if let Err(e) = listener_backend.listen(event_tx, subscriptions).await {
+        let adapter = listener_adapter.read().await;
+        if let Err(e) = adapter.listen(event_tx, subscriptions).await {
             error!("Backend listener error: {}", e);
         }
     });
@@ -470,8 +605,11 @@ async fn run_daemon(config: Config) -> Result<()> {
 
     // Signal the backend to stop its event loop
     debug!("Calling backend shutdown()...");
-    if let Err(e) = listener_backend_for_shutdown.shutdown().await {
-        warn!("Backend shutdown error: {}", e);
+    {
+        let adapter = listener_adapter_for_shutdown.read().await;
+        if let Err(e) = adapter.shutdown().await {
+            warn!("Backend shutdown error: {}", e);
+        }
     }
     debug!("Backend shutdown() returned");
 

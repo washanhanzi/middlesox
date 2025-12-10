@@ -1,0 +1,17 @@
+# Maintainer: Your Name <your.email@example.com>
+pkgname=msx-bin
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="Scriptable Compositor Controller - CLI"
+arch=('x86_64')
+url="https://github.com/washanhanzi/middlesox"
+license=('MIT')
+provides=('msx')
+conflicts=('msx')
+
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/washanhanzi/middlesox/releases/download/v${pkgver}/msx-${pkgver}-x86_64-linux.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    install -Dm755 "${srcdir}/msx" "${pkgdir}/usr/bin/msx"
+}

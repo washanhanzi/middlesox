@@ -26,7 +26,7 @@ struct EventContext {
 /// manifest before allowing them to execute.
 pub struct ScriptEngine {
     adapter: Arc<RwLock<BoxedAdapter>>,
-    manifest: CapabilityManifest,
+    manifest: Arc<RwLock<CapabilityManifest>>,
 }
 
 impl ScriptEngine {
@@ -36,8 +36,39 @@ impl ScriptEngine {
 
         Self {
             adapter: Arc::new(RwLock::new(adapter)),
-            manifest,
+            manifest: Arc::new(RwLock::new(manifest)),
         }
+    }
+
+    /// Create a new script engine with a shared adapter.
+    ///
+    /// Use this when you need to share the adapter between the engine
+    /// and other components (e.g., event listener).
+    pub fn with_shared_adapter(adapter: Arc<RwLock<BoxedAdapter>>) -> Self {
+        // Get initial manifest (may be empty for async adapters like socket)
+        let manifest = {
+            // Use try_read to avoid blocking, fall back to empty manifest
+            adapter
+                .try_read()
+                .map(|a| a.manifest())
+                .unwrap_or_else(|_| CapabilityManifest::new())
+        };
+
+        Self {
+            adapter,
+            manifest: Arc::new(RwLock::new(manifest)),
+        }
+    }
+
+    /// Refresh the capability manifest from the adapter.
+    ///
+    /// Call this after the adapter has had a chance to fetch capabilities
+    /// (e.g., after an async initialization or first get/set call).
+    pub async fn refresh_manifest(&self) {
+        let adapter = self.adapter.read().await;
+        let new_manifest = adapter.manifest();
+        let mut manifest = self.manifest.write().await;
+        *manifest = new_manifest;
     }
 
     fn create_engine() -> Engine {
@@ -81,7 +112,8 @@ impl ScriptEngine {
 
     async fn execute_with_context(&self, script: &str, context: Option<EventContext>) -> Result<Dynamic> {
         let adapter = self.adapter.clone();
-        let manifest = self.manifest.clone();
+        // Clone the manifest for the blocking task
+        let manifest = self.manifest.read().await.clone();
         let script = script.to_string();
 
         // Run the script in a blocking task since Rhai isn't async
@@ -207,8 +239,18 @@ impl ScriptEngine {
     }
 
     /// Get the capability manifest.
-    pub fn manifest(&self) -> &CapabilityManifest {
-        &self.manifest
+    ///
+    /// Note: This clones the manifest. For async access, use `manifest_async()`.
+    pub fn manifest(&self) -> CapabilityManifest {
+        self.manifest
+            .try_read()
+            .map(|m| m.clone())
+            .unwrap_or_else(|_| CapabilityManifest::new())
+    }
+
+    /// Get the capability manifest asynchronously.
+    pub async fn manifest_async(&self) -> CapabilityManifest {
+        self.manifest.read().await.clone()
     }
 
     /// Get a value from the backend.
@@ -227,6 +269,14 @@ impl ScriptEngine {
     pub async fn adapter_name(&self) -> String {
         let adapter = self.adapter.read().await;
         adapter.name().to_string()
+    }
+
+    /// Get a clone of the shared adapter reference.
+    ///
+    /// Use this when you need to share the adapter with other components
+    /// (e.g., event listener).
+    pub fn shared_adapter(&self) -> Arc<RwLock<BoxedAdapter>> {
+        self.adapter.clone()
     }
 }
 

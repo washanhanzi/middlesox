@@ -5,7 +5,13 @@ default_to_workspace = false
 description = "Build middlesox-cli and install to ~/.local/bin"
 script = '''
 cargo build --release -p middlesox-cli
-mkdir -p ~/.local/bin
-cp target/release/msx ~/.local/bin/
+cp target/release/msx ~/.local/bin/msx
 echo "Installed msx to ~/.local/bin/msx"
+'''
+
+[tasks.run]
+description = "Build and run msx with example config"
+script = '''
+cargo build --release -p middlesox-cli
+./target/release/msx --config ./example/config.toml run
 '''

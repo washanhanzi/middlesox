@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
@@ -113,12 +113,15 @@ impl TestHarness {
         let lock_file = acquire_lock_in(&lock_path)?;
         self._lock_file = Some(lock_file);
 
-        // Create backend
+        // Create backend - single instance shared between engine and listener
         let backend: BoxedAdapter = Box::new(MockBackend::new());
-        let listener_backend: BoxedAdapter = Box::new(MockBackend::new());
 
-        // Create engine and controller
+        // Create engine with the backend
         let engine = ScriptEngine::new(backend);
+
+        // Get the shared adapter for the event listener
+        let shared_adapter = engine.shared_adapter();
+
         let subscriptions = self.config.subscribed_events();
         let controller = Arc::new(Controller::new(
             self.config.clone(),
@@ -136,7 +139,7 @@ impl TestHarness {
 
         // Spawn daemon task
         let handle = tokio::spawn(run_daemon_inner(
-            listener_backend,
+            shared_adapter,
             subscriptions,
             controller,
             control_listener,
@@ -330,7 +333,7 @@ impl Controller {
 }
 
 async fn run_daemon_inner(
-    listener_backend: BoxedAdapter,
+    shared_adapter: Arc<RwLock<BoxedAdapter>>,
     subscriptions: HashSet<String>,
     controller: Arc<Controller>,
     control_listener: UnixListener,
@@ -341,9 +344,11 @@ async fn run_daemon_inner(
     // Event channel
     let (event_tx, mut event_rx) = mpsc::channel::<RawEvent>(100);
 
-    // Spawn event listener
+    // Spawn event listener using the shared adapter
+    let listener_adapter = shared_adapter.clone();
     let listener_handle = tokio::spawn(async move {
-        if let Err(e) = listener_backend.listen(event_tx, subscriptions).await {
+        let adapter = listener_adapter.read().await;
+        if let Err(e) = adapter.listen(event_tx, subscriptions).await {
             error!("Backend listener error: {}", e);
         }
     });

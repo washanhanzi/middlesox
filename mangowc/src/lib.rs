@@ -51,6 +51,42 @@ mod dwl_ipc {
 
 use dwl_ipc::{zdwl_ipc_manager_v2::ZdwlIpcManagerV2, zdwl_ipc_output_v2::ZdwlIpcOutputV2};
 
+/// Map layout codes to human-readable names.
+fn layout_code_to_name(code: &str) -> &str {
+    match code {
+        "S" => "Scroller",
+        "T" => "Tile",
+        "G" => "Grid",
+        "M" => "Monocle",
+        "K" | "D" => "Deck",
+        "CT" | "C" => "Center Tile",
+        "VS" => "Vertical Scroller",
+        "VT" | "VK" => "Vertical Tile",
+        "VG" => "Vertical Grid",
+        "RT" => "Right Tile",
+        "VD" => "Vertical Deck",
+        _ => code, // fallback to raw code
+    }
+}
+
+/// Map human-readable names back to layout codes.
+fn layout_name_to_code(name: &str) -> &str {
+    match name {
+        "Scroller" => "S",
+        "Tile" => "T",
+        "Grid" => "G",
+        "Monocle" => "M",
+        "Deck" => "D",
+        "Center Tile" => "CT",
+        "Vertical Scroller" => "VS",
+        "Vertical Tile" => "VT",
+        "Vertical Grid" => "VG",
+        "Right Tile" => "RT",
+        "Vertical Deck" => "VD",
+        _ => name, // fallback to input
+    }
+}
+
 // ============================================================================
 // State Types
 // ============================================================================
@@ -448,10 +484,11 @@ impl Dispatch<ZdwlIpcOutputV2, u32> for WaylandState {
                         }
 
                         if prev.layout_idx != pending_state.layout_idx {
-                            let layout_name = state.state.global.layouts
+                            let layout_code = state.state.global.layouts
                                 .get(pending_state.layout_idx as usize)
-                                .cloned()
-                                .unwrap_or_default();
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
+                            let layout_name = layout_code_to_name(layout_code);
                             state.emit_event(
                                 "layout_change",
                                 Some([
@@ -666,6 +703,8 @@ impl ProtocolAdapter for MangoWcBackend {
     fn manifest(&self) -> CapabilityManifest {
         CapabilityManifest::new()
             .add(Capability::read_write("layout").with_description("Window layout index"))
+            .add(Capability::read_write("layout_name").with_description("Window layout name"))
+            .add(Capability::read_only("layouts").with_description("Available layout names"))
             .add(Capability::read_write("tags").with_description("Active tag bitmask"))
             .add(Capability::read_only("title").with_description("Focused window title"))
             .add(Capability::read_only("appid").with_description("Focused window app ID"))
@@ -712,6 +751,20 @@ impl ProtocolAdapter for MangoWcBackend {
 
         match key {
             "layout" => Ok(Value::from(output.layout_idx)),
+            "layout_name" => {
+                let code = state.global.layouts
+                    .get(output.layout_idx as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                Ok(Value::from(layout_code_to_name(code)))
+            }
+            "layouts" => {
+                let names: Vec<String> = state.global.layouts
+                    .iter()
+                    .map(|code| layout_code_to_name(code).to_string())
+                    .collect();
+                Ok(Value::from(names))
+            }
             "tags" => Ok(Value::from(output.active_tags)),
             "title" => Ok(Value::from(output.title.clone())),
             "appid" => Ok(Value::from(output.appid.clone())),
@@ -739,6 +792,27 @@ impl ProtocolAdapter for MangoWcBackend {
             "layout" => {
                 let index = value.as_u64()
                     .ok_or_else(|| anyhow!("layout must be a number"))? as u32;
+                cmd_tx.send(WaylandCommand::SetLayout { index })
+                    .map_err(|_| anyhow!("Wayland thread closed"))?;
+                Ok(())
+            }
+            "layout_name" => {
+                let name = value.as_str()
+                    .ok_or_else(|| anyhow!("layout_name must be a string"))?;
+                let code = layout_name_to_code(name);
+
+                // Get current state to find layout index
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                cmd_tx.send(WaylandCommand::GetState { reply: reply_tx })
+                    .map_err(|_| anyhow!("Wayland thread closed"))?;
+                let state = reply_rx.recv().map_err(|_| anyhow!("No response from Wayland thread"))?;
+
+                // Find the index of the layout code
+                let index = state.global.layouts
+                    .iter()
+                    .position(|c| c == code)
+                    .ok_or_else(|| anyhow!("Layout '{}' not found", name))? as u32;
+
                 cmd_tx.send(WaylandCommand::SetLayout { index })
                     .map_err(|_| anyhow!("Wayland thread closed"))?;
                 Ok(())

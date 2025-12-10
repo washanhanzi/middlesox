@@ -1,0 +1,97 @@
+name: AUR Publish
+
+on:
+    push:
+        branches:
+            - aur/bin
+
+jobs:
+    aur:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Get latest release
+              id: release
+              run: |
+                  RELEASE=$(curl -s https://api.github.com/repos/washanhanzi/middlesox/releases/latest)
+                  VERSION=$(echo "$RELEASE" | jq -r '.tag_name' | sed 's/^v//')
+                  TARBALL_URL="https://github.com/washanhanzi/middlesox/releases/download/v${VERSION}/msx-${VERSION}-x86_64-linux.tar.gz"
+                  SHA256=$(curl -sL "${TARBALL_URL}.sha256" | awk '{print $1}')
+                  echo "version=$VERSION" >> $GITHUB_OUTPUT
+                  echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+                  echo "Latest version: $VERSION"
+                  echo "SHA256: $SHA256"
+
+            - name: Get current PKGBUILD version
+              id: current
+              run: |
+                  PKGVER=$(grep '^pkgver=' aur/bin/PKGBUILD | cut -d'=' -f2)
+                  PKGREL=$(grep '^pkgrel=' aur/bin/PKGBUILD | cut -d'=' -f2)
+                  echo "pkgver=$PKGVER" >> $GITHUB_OUTPUT
+                  echo "pkgrel=$PKGREL" >> $GITHUB_OUTPUT
+                  echo "Current PKGBUILD: $PKGVER-$PKGREL"
+
+            - name: Update PKGBUILD
+              run: |
+                  VERSION="${{ steps.release.outputs.version }}"
+                  SHA256="${{ steps.release.outputs.sha256 }}"
+                  CURRENT_VER="${{ steps.current.outputs.pkgver }}"
+                  CURRENT_REL="${{ steps.current.outputs.pkgrel }}"
+
+                  if [ "$VERSION" = "$CURRENT_VER" ]; then
+                    NEW_REL=$((CURRENT_REL + 1))
+                  else
+                    NEW_REL=1
+                  fi
+
+                  sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur/bin/PKGBUILD
+                  sed -i "s/^pkgrel=.*/pkgrel=$NEW_REL/" aur/bin/PKGBUILD
+                  sed -i "s/^sha256sums=.*/sha256sums=('$SHA256')/" aur/bin/PKGBUILD
+
+                  echo "Updated to $VERSION-$NEW_REL"
+
+            - name: Generate .SRCINFO
+              run: |
+                  docker run --rm -v "$PWD/aur/bin:/pkg" archlinux:latest bash -c "
+                    pacman -Sy --noconfirm pacman-contrib
+                    useradd -m builder
+                    chown -R builder:builder /pkg
+                    cd /pkg
+                    su builder -c 'makepkg --printsrcinfo > .SRCINFO'
+                  "
+
+            - name: Setup SSH
+              run: |
+                  mkdir -p ~/.ssh
+                  echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+                  chmod 600 ~/.ssh/aur
+                  echo "Host aur.archlinux.org" >> ~/.ssh/config
+                  echo "  IdentityFile ~/.ssh/aur" >> ~/.ssh/config
+                  echo "  User aur" >> ~/.ssh/config
+                  ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+            - name: Clone AUR repo and push
+              run: |
+                  git config --global user.name "github-actions[bot]"
+                  git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+                  # Clone GitHub mirror
+                  git clone https://github.com/washanhanzi/msx-bin.git aur-repo
+                  cd aur-repo
+
+                  # Copy updated files
+                  cp ../aur/bin/PKGBUILD .
+                  cp ../aur/bin/.SRCINFO .
+
+                  # Commit
+                  git add PKGBUILD .SRCINFO
+                  git commit -m "Update to ${{ steps.release.outputs.version }}" || echo "No changes to commit"
+
+                  # Force push to GitHub mirror
+                  git push --force https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/washanhanzi/msx-bin.git main
+
+                  # Add AUR remote and force push
+                  git remote add aur ssh://aur@aur.archlinux.org/msx-bin.git
+                  git push --force aur main:master

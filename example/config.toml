@@ -1,0 +1,19 @@
+[adapter]
+name = "mangowc"
+
+[settings]
+log_level = "debug"
+scripts_dir = "./example/scripts"
+
+[[watch]]
+event="tag_change"
+exec="echo.sh"
+
+[[watch]]
+event="layout_change"
+exec="layout_notify.sh"
+
+[[command]]
+name = "cycle_layout"
+script = "cycle_layout.rhai"
+description = "Cycle through Tile and Scroller layouts"

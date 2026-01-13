@@ -6,7 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
-middlesox = { workspace = true, features = ["mock"] }
+middlesox.workspace = true
+middlesox-mock.workspace = true
 
 # Async runtime
 tokio.workspace = true

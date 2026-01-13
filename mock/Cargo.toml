@@ -1,0 +1,17 @@
+[package]
+name = "middlesox-mock"
+version.workspace = true
+edition.workspace = true
+description = "Mock backend for Middlesox testing"
+
+[lib]
+name = "middlesox_mock"
+path = "src/lib.rs"
+
+[dependencies]
+middlesox.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

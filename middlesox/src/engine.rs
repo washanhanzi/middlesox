@@ -1,15 +1,14 @@
 //! Rhai scripting engine with security enforcement.
 //!
 //! This module wraps the Rhai scripting engine and provides secure
-//! access to window manager state through the protocol adapter.
+//! access to window manager state through the adapter handle.
 
-use crate::{BoxedAdapter, CapabilityManifest, RawEvent};
+use crate::adapter_handle::AdapterHandle;
+use crate::RawEvent;
 use anyhow::{anyhow, Result};
 use rhai::{Dynamic, Engine, Scope};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
 /// Event context passed to scripts.
@@ -23,52 +22,16 @@ struct EventContext {
 /// Security-enforced script engine for window manager control.
 ///
 /// Wraps Rhai and validates all operations against the capability
-/// manifest before allowing them to execute.
+/// manifest before allowing them to execute. The manifest is fetched
+/// from the adapter handle on each security check.
 pub struct ScriptEngine {
-    adapter: Arc<RwLock<BoxedAdapter>>,
-    manifest: Arc<RwLock<CapabilityManifest>>,
+    adapter: AdapterHandle,
 }
 
 impl ScriptEngine {
-    /// Create a new script engine with the given adapter.
-    pub fn new(adapter: BoxedAdapter) -> Self {
-        let manifest = adapter.manifest();
-
-        Self {
-            adapter: Arc::new(RwLock::new(adapter)),
-            manifest: Arc::new(RwLock::new(manifest)),
-        }
-    }
-
-    /// Create a new script engine with a shared adapter.
-    ///
-    /// Use this when you need to share the adapter between the engine
-    /// and other components (e.g., event listener).
-    pub fn with_shared_adapter(adapter: Arc<RwLock<BoxedAdapter>>) -> Self {
-        // Get initial manifest (may be empty for async adapters like socket)
-        let manifest = {
-            // Use try_read to avoid blocking, fall back to empty manifest
-            adapter
-                .try_read()
-                .map(|a| a.manifest())
-                .unwrap_or_else(|_| CapabilityManifest::new())
-        };
-
-        Self {
-            adapter,
-            manifest: Arc::new(RwLock::new(manifest)),
-        }
-    }
-
-    /// Refresh the capability manifest from the adapter.
-    ///
-    /// Call this after the adapter has had a chance to fetch capabilities
-    /// (e.g., after an async initialization or first get/set call).
-    pub async fn refresh_manifest(&self) {
-        let adapter = self.adapter.read().await;
-        let new_manifest = adapter.manifest();
-        let mut manifest = self.manifest.write().await;
-        *manifest = new_manifest;
+    /// Create a new script engine with the given adapter handle.
+    pub fn new(adapter: AdapterHandle) -> Self {
+        Self { adapter }
     }
 
     fn create_engine() -> Engine {
@@ -88,7 +51,8 @@ impl ScriptEngine {
     ///
     /// The script can use:
     /// - `get("key")` - Query a value from the window manager
-    /// - `set("key", value)` - Set a value in the window manager (security-checked)
+    /// - `set("key", value)` - Set a value in the window manager (security-checked).
+    ///   Returns an empty string on success or an error message on failure.
     pub async fn execute(&self, script: &str) -> Result<Dynamic> {
         self.execute_with_context(script, None).await
     }
@@ -97,7 +61,8 @@ impl ScriptEngine {
     ///
     /// The script can use:
     /// - `get("key")` - Query a value from the window manager
-    /// - `set("key", value)` - Set a value in the window manager (security-checked)
+    /// - `set("key", value)` - Set a value in the window manager (security-checked).
+    ///   Returns an empty string on success or an error message on failure.
     /// - `event_name` - Name of the event that triggered the script
     /// - `prev` - Previous state (map)
     /// - `curr` - Current state (map)
@@ -112,13 +77,11 @@ impl ScriptEngine {
 
     async fn execute_with_context(&self, script: &str, context: Option<EventContext>) -> Result<Dynamic> {
         let adapter = self.adapter.clone();
-        // Clone the manifest for the blocking task
-        let manifest = self.manifest.read().await.clone();
         let script = script.to_string();
 
         // Run the script in a blocking task since Rhai isn't async
         let result = tokio::task::spawn_blocking(move || {
-            Self::execute_sync(&script, adapter, manifest, context)
+            Self::execute_sync(&script, adapter, context)
         })
         .await
         .map_err(|e| anyhow!("Script task panicked: {}", e))??;
@@ -128,11 +91,9 @@ impl ScriptEngine {
 
     fn execute_sync(
         script: &str,
-        adapter: Arc<RwLock<BoxedAdapter>>,
-        manifest: CapabilityManifest,
+        adapter: AdapterHandle,
         context: Option<EventContext>,
     ) -> Result<Dynamic> {
-        // Create a new runtime for blocking operations
         let rt = tokio::runtime::Handle::current();
 
         let mut engine = Self::create_engine();
@@ -148,7 +109,6 @@ impl ScriptEngine {
         // Clone for closures
         let adapter_get = adapter.clone();
         let adapter_set = adapter.clone();
-        let manifest_set = manifest.clone();
 
         // Register the `get` function
         engine.register_fn("get", move |key: &str| -> Dynamic {
@@ -156,7 +116,6 @@ impl ScriptEngine {
             let key = key.to_string();
 
             rt.block_on(async {
-                let adapter = adapter.read().await;
                 match adapter.get(&key).await {
                     Ok(value) => json_to_dynamic(value),
                     Err(e) => {
@@ -167,19 +126,28 @@ impl ScriptEngine {
             })
         });
 
-        // Register the `set` function with security enforcement
+        // Register the `set` function with security enforcement.
+        // Returns "" on success or an error message string on failure.
         let rt2 = tokio::runtime::Handle::current();
-        engine.register_fn("set", move |key: &str, value: Dynamic| -> bool {
+        engine.register_fn("set", move |key: &str, value: Dynamic| -> String {
             let adapter = adapter_set.clone();
-            let manifest = manifest_set.clone();
             let key = key.to_string();
+
+            // Fetch manifest from adapter
+            let manifest = match rt2.block_on(adapter.manifest()) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Script set('{}') failed to get manifest: {}", key, e);
+                    return format!("failed to get manifest: {}", e);
+                }
+            };
 
             // Security check: validate against manifest
             let capability = match manifest.find(&key) {
                 Some(cap) => cap.clone(),
                 None => {
                     warn!("Script tried to set unknown key: {}", key);
-                    return false;
+                    return format!("unknown key: {}", key);
                 }
             };
 
@@ -188,21 +156,20 @@ impl ScriptEngine {
                     "Security violation: script tried to write read-only key '{}'",
                     key
                 );
-                return false;
+                return format!("read-only key: {}", key);
             }
 
             let json_value = dynamic_to_json(value);
 
             rt2.block_on(async {
-                let adapter = adapter.read().await;
                 match adapter.set(&key, json_value).await {
                     Ok(()) => {
                         debug!("Script set('{}') succeeded", key);
-                        true
+                        String::new()
                     }
                     Err(e) => {
                         error!("Script set('{}') failed: {}", key, e);
-                        false
+                        format!("adapter error: {}", e)
                     }
                 }
             })
@@ -236,47 +203,6 @@ impl ScriptEngine {
     pub async fn execute_file_with_event(&self, path: &std::path::Path, event: &RawEvent) -> Result<Dynamic> {
         let script = tokio::fs::read_to_string(path).await?;
         self.execute_with_event(&script, event).await
-    }
-
-    /// Get the capability manifest.
-    ///
-    /// Note: This clones the manifest. For async access, use `manifest_async()`.
-    pub fn manifest(&self) -> CapabilityManifest {
-        self.manifest
-            .try_read()
-            .map(|m| m.clone())
-            .unwrap_or_else(|_| CapabilityManifest::new())
-    }
-
-    /// Get the capability manifest asynchronously.
-    pub async fn manifest_async(&self) -> CapabilityManifest {
-        self.manifest.read().await.clone()
-    }
-
-    /// Get a value from the backend.
-    pub async fn get(&self, key: &str) -> Result<Value> {
-        let adapter = self.adapter.read().await;
-        adapter.get(key).await
-    }
-
-    /// Set a value in the backend.
-    pub async fn set(&self, key: &str, value: Value) -> Result<()> {
-        let adapter = self.adapter.read().await;
-        adapter.set(key, value).await
-    }
-
-    /// Get the adapter name.
-    pub async fn adapter_name(&self) -> String {
-        let adapter = self.adapter.read().await;
-        adapter.name().to_string()
-    }
-
-    /// Get a clone of the shared adapter reference.
-    ///
-    /// Use this when you need to share the adapter with other components
-    /// (e.g., event listener).
-    pub fn shared_adapter(&self) -> Arc<RwLock<BoxedAdapter>> {
-        self.adapter.clone()
     }
 }
 
@@ -349,15 +275,85 @@ fn dynamic_to_json(value: Dynamic) -> Value {
     }
 }
 
-#[cfg(all(test, feature = "mock"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MockBackend;
+    use crate::{Capability, CapabilityManifest, ProtocolAdapter, RawEvent};
+    use std::collections::HashSet;
+
+    /// Minimal in-crate mock for engine tests.
+    struct TestBackend {
+        workspace: i64,
+        layout: String,
+    }
+
+    impl TestBackend {
+        fn new() -> Self {
+            Self {
+                workspace: 1,
+                layout: "master".into(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProtocolAdapter for TestBackend {
+        fn name(&self) -> &str { "test" }
+
+        fn manifest(&self) -> CapabilityManifest {
+            CapabilityManifest::new()
+                .add(Capability::read_write("workspace"))
+                .add(Capability::read_write("layout"))
+                .add(Capability::read_only("monitor"))
+        }
+
+        async fn subscribe(&mut self, _subs: HashSet<String>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn next_event(&mut self) -> anyhow::Result<Option<RawEvent>> {
+            // Never produces events — just pend forever
+            std::future::pending().await
+        }
+
+        async fn get(&mut self, key: &str) -> anyhow::Result<Value> {
+            match key {
+                "workspace" => Ok(Value::from(self.workspace)),
+                "layout" => Ok(Value::from(self.layout.clone())),
+                "monitor" => Ok(Value::from("TEST-1")),
+                _ => Err(anyhow!("Unknown key: {}", key)),
+            }
+        }
+
+        async fn set(&mut self, key: &str, value: Value) -> anyhow::Result<()> {
+            match key {
+                "workspace" => {
+                    self.workspace = value.as_i64().unwrap();
+                    Ok(())
+                }
+                "layout" => {
+                    self.layout = value.as_str().unwrap().to_string();
+                    Ok(())
+                }
+                _ => Err(anyhow!("Read-only or unknown key: {}", key)),
+            }
+        }
+    }
+
+    async fn test_handle() -> AdapterHandle {
+        let (handle, _event_rx, _join) = AdapterHandle::spawn(
+            Box::new(TestBackend::new()),
+            HashSet::new(),
+        )
+        .await
+        .unwrap();
+        handle
+    }
 
     #[tokio::test]
     async fn test_script_get() {
-        let backend = MockBackend::new();
-        let engine = ScriptEngine::new(Box::new(backend));
+        let handle = test_handle().await;
+        let engine = ScriptEngine::new(handle);
 
         let result = engine.execute(r#"get("workspace")"#).await.unwrap();
         assert_eq!(result.as_int().unwrap(), 1);
@@ -365,13 +361,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_script_set() {
-        let backend = MockBackend::new();
-        let engine = ScriptEngine::new(Box::new(backend));
+        let handle = test_handle().await;
+        let engine = ScriptEngine::new(handle);
 
         let script = r#"
             let current = get("layout");
             if current == "master" {
-                set("layout", "grid");
+                let err = set("layout", "grid");
+                if err != "" { throw err; }
             }
             get("layout")
         "#;
@@ -382,28 +379,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_script_security() {
-        let backend = MockBackend::new();
-        let engine = ScriptEngine::new(Box::new(backend));
+        let handle = test_handle().await;
+        let engine = ScriptEngine::new(handle);
 
-        // Trying to set a read-only value should fail (return false)
+        // Trying to set a read-only value should return an error message
         let script = r#"set("monitor", "test")"#;
         let result = engine.execute(script).await.unwrap();
-        assert!(!result.as_bool().unwrap());
+        let err_msg = result.into_string().unwrap();
+        assert!(err_msg.contains("read-only"), "Expected read-only error, got: {}", err_msg);
     }
 
     #[tokio::test]
     async fn test_script_with_event_context() {
-        use crate::RawEvent;
-
-        let backend = MockBackend::new();
-        let engine = ScriptEngine::new(Box::new(backend));
+        let handle = test_handle().await;
+        let engine = ScriptEngine::new(handle);
 
         let event = RawEvent::new("workspace_change")
             .with_prev("id", 1)
             .with_curr("id", 2)
             .with_curr("monitor", "HDMI-1");
 
-        // Script can access event context
         let script = r#"
             if curr.id > prev.id {
                 "increased"

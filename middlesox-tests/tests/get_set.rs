@@ -130,7 +130,26 @@ async fn test_set_readonly_fails() {
         .unwrap();
 
     assert!(!resp.success, "setting read-only key should fail");
-    assert!(resp.error.unwrap().contains("read-only"));
+    assert_eq!(resp.error.as_deref(), Some("read-only key: monitor"));
+
+    harness.stop_daemon().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_set_unknown_key_rejected_by_manifest() {
+    let mut harness = TestHarness::new().await.unwrap();
+    harness.start_daemon().await.unwrap();
+
+    let resp = harness
+        .send_request(&ControlRequest::Set {
+            key: "missing".into(),
+            value: json!(1),
+        })
+        .await
+        .unwrap();
+
+    assert!(!resp.success, "setting unknown key should fail");
+    assert_eq!(resp.error.as_deref(), Some("unknown key: missing"));
 
     harness.stop_daemon().await.unwrap();
 }

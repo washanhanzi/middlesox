@@ -10,14 +10,54 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+/// Timeout for CLI-to-daemon IPC round-trips.
+const IPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Get the runtime directory for sockets and lock files.
+///
+/// Prefers `XDG_RUNTIME_DIR` (set by systemd on all modern Linux).
+/// Falls back to a user-specific subdirectory under `/tmp` with
+/// restricted permissions to avoid symlink/clobber attacks.
 pub fn runtime_dir() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    // Fallback: user-specific subdirectory under /tmp.
+    // Using /tmp directly is unsafe (world-writable, symlink attacks).
+    let uid = unsafe { libc::getuid() };
+    let fallback = PathBuf::from(format!("/tmp/middlesox-{}", uid));
+
+    match std::fs::create_dir(&fallback) {
+        Ok(()) => {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &fallback,
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Validate: not a symlink and owned by us
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::symlink_metadata(&fallback)
+                && (meta.file_type().is_symlink() || meta.uid() != uid)
+            {
+                // Refuse to use an attacker-controlled path; return a path
+                // that downstream operations will fail on with a clear error.
+                return PathBuf::from(format!(
+                    "/run/middlesox-rejected-{}",
+                    std::process::id()
+                ));
+            }
+        }
+        Err(_) => {}
+    }
+
+    fallback
 }
 
 /// Path to the lock file.
@@ -49,7 +89,13 @@ pub fn acquire_lock() -> Result<File> {
 
 /// Acquire an exclusive lock at a custom path.
 pub fn acquire_lock_in(path: &Path) -> Result<File> {
-    let file = File::create(path)
+    // Open with create + read/write but do NOT truncate yet.
+    // Truncating before flock would clobber an active daemon's PID.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
         .with_context(|| format!("Failed to create lock file: {}", path.display()))?;
 
     let fd = file.as_raw_fd();
@@ -62,7 +108,8 @@ pub fn acquire_lock_in(path: &Path) -> Result<File> {
         ));
     }
 
-    // Write PID for status checks
+    // Lock acquired — now safe to truncate and write our PID
+    file.set_len(0)?;
     let mut f = &file;
     writeln!(f, "{}", std::process::id())?;
 
@@ -169,11 +216,29 @@ pub async fn create_listener() -> Result<UnixListener> {
 }
 
 /// Create the control socket listener at a custom path.
+///
+/// Uses `symlink_metadata` instead of `exists()` to detect symlinks
+/// without following them, preventing TOCTOU symlink attacks.
 pub async fn create_listener_at(path: &Path) -> Result<UnixListener> {
-    // Remove existing socket file if present
-    if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("Failed to remove existing socket: {}", path.display()))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "Refusing to replace symlink at socket path: {}",
+                    path.display()
+                ));
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("Failed to remove existing socket: {}", path.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to check socket path {}: {}",
+                path.display(),
+                e
+            ));
+        }
     }
 
     UnixListener::bind(path)
@@ -209,19 +274,30 @@ pub async fn send_request_to(
     socket_path: &Path,
     request: &ControlRequest,
 ) -> Result<ControlResponse> {
-    let mut stream = connect_to(socket_path).await?;
+    let result = tokio::time::timeout(IPC_TIMEOUT, async {
+        let mut stream = connect_to(socket_path).await?;
 
-    // Send request
-    let mut line = serde_json::to_string(request)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes()).await?;
+        // Send request
+        let mut line = serde_json::to_string(request)?;
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await?;
 
-    // Read response
-    let mut reader = BufReader::new(stream);
-    let mut response_line = String::new();
-    reader.read_line(&mut response_line).await?;
+        // Read response
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader.read_line(&mut response_line).await?;
 
-    serde_json::from_str(&response_line).context("Invalid response from daemon")
+        serde_json::from_str(&response_line).context("Invalid response from daemon")
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(anyhow!(
+            "Daemon did not respond within {}s",
+            IPC_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Cleanup socket file on shutdown.

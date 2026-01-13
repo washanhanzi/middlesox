@@ -3,6 +3,7 @@ members = [
     "middlesox",
     "hyprland",
     "mangowc",
+    "mock",
     "socket",
     "middlesox-cli",
     "middlesox-tests",
@@ -17,6 +18,7 @@ license = "MIT"
 [workspace.dependencies]
 # The base crate
 middlesox = { path = "middlesox" }
+middlesox-mock = { path = "mock" }
 middlesox-socket = { path = "socket" }
 middlesox-mangowc = { path = "mangowc" }
 
@@ -28,9 +30,6 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
-
-# Concurrent state
-dashmap = "6"
 
 # Scripting
 rhai = { version = "1", features = ["sync"] }

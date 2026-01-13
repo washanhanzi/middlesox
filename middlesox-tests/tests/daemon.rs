@@ -36,7 +36,14 @@ async fn test_daemon_stop() {
         .unwrap();
     assert!(resp.success);
 
-    // Stop the harness
+    // Wait briefly for the daemon to shut down
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Verify the daemon actually stopped: subsequent requests should fail
+    let result = harness.send_request(&ControlRequest::Status).await;
+    assert!(result.is_err(), "Daemon should have stopped after Stop request");
+
+    // Clean up harness state
     harness.stop_daemon().await.unwrap();
 }
 

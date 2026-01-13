@@ -24,7 +24,6 @@ use async_trait::async_trait;
 use middlesox::{Capability, CapabilityManifest, ProtocolAdapter, RawEvent};
 use serde_json::Value;
 use std::collections::HashSet;
-use tokio::sync::mpsc;
 use tracing::info;
 
 /// Hyprland protocol adapter.
@@ -69,24 +68,20 @@ impl ProtocolAdapter for HyprlandBackend {
             .add(Capability::read_write("fullscreen").with_description("Fullscreen state"))
     }
 
-    async fn listen(
-        &self,
-        _event_tx: mpsc::Sender<RawEvent>,
-        _subscriptions: HashSet<String>,
-    ) -> Result<()> {
-        // TODO: Connect to .socket2.sock and parse event stream
-        // Format: event>>data\n
-        // Examples:
-        //   workspace>>2
-        //   activewindow>>kitty,Terminal
-        //   fullscreen>>1
-        //
-        // Only emit events that are in the subscriptions set
-        info!("Hyprland backend: listen() not yet implemented");
+    async fn subscribe(&mut self, _subscriptions: HashSet<String>) -> Result<()> {
+        // TODO: Connect to .socket2.sock and set up event parsing
+        info!("Hyprland backend: subscribe() not yet implemented");
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Value> {
+    async fn next_event(&mut self) -> Result<Option<RawEvent>> {
+        // TODO: Parse event stream from .socket2.sock
+        // Format: event>>data\n
+        info!("Hyprland backend: next_event() not yet implemented");
+        std::future::pending().await
+    }
+
+    async fn get(&mut self, key: &str) -> Result<Value> {
         // TODO: Execute hyprctl commands and parse JSON output
         // hyprctl -j activewindow
         // hyprctl -j monitors
@@ -94,7 +89,7 @@ impl ProtocolAdapter for HyprlandBackend {
         Err(anyhow!("Hyprland get('{}') not yet implemented", key))
     }
 
-    async fn set(&self, key: &str, _value: Value) -> Result<()> {
+    async fn set(&mut self, key: &str, _value: Value) -> Result<()> {
         // TODO: Execute hyprctl dispatch commands
         // hyprctl dispatch workspace 2
         // hyprctl dispatch fullscreen 1

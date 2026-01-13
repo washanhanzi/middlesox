@@ -82,6 +82,7 @@ impl Request {
     }
 }
 
+#[cfg(test)]
 impl Response {
     /// Create a success response.
     pub fn success(id: u64, result: Value) -> Self {
@@ -102,6 +103,7 @@ impl Response {
     }
 }
 
+#[cfg(test)]
 impl Event {
     /// Create a new event.
     pub fn new(name: impl Into<String>) -> Self {

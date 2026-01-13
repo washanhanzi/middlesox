@@ -6,19 +6,18 @@ Universal Window Manager Controller - scriptable event-driven automation for any
 
 ```
 ┌─────────────────────────────────────────────┐
-│         User Scripts (Rhai / Shell)         │
-│    get("workspace"), set("layout", "grid")  │
+│            User / CLI (`msx ...`)           │
 └──────────────────────┬──────────────────────┘
-                       │
+                       │ JSON Lines over Unix socket
 ┌──────────────────────┴──────────────────────┐
-│              msx daemon                     │
-│         (control socket + flock)            │
+│                 msx daemon                  │
+│   Controller + Adapter Actor + Script I/O   │
 └──────────────────────┬──────────────────────┘
-                       │ ProtocolAdapter
-       ┌───────────────┼───────────────┐
-       ▼               ▼               ▼
-   Hyprland        MangoWC          i3/Sway
-   (Wayland)      (Wayland)          (X11)
+                       │ `ProtocolAdapter`
+       ┌───────────────┼───────────────┬───────────────┐
+       ▼               ▼               ▼               ▼
+      mock          mangowc          socket       hyprland
+    (testing)      (Wayland)     (external IPC)    (stub)
 ```
 
 ## Configuration
@@ -28,16 +27,18 @@ Config file is loaded from (first match wins):
 2. `~/.config/middlesox/config.toml`
 3. `/etc/middlesox/config.toml`
 
+If no config file is found, `msx` falls back to a built-in default config. Today that means the `mock` adapter plus a default `workspace_change -> on_workspace_change.rhai` watch.
+
 ### Example
 
 ```toml
 [settings]
-scripts_dir = "~/.config/middlesox/scripts"  # Default location
+scripts_dir = "~/.config/middlesox/scripts"  # Example scripts directory
 log_level = "info"                           # trace, debug, info, warn, error
 
-# Adapter: mock, hyprland, mangowc, or socket
+# Adapter: mock, mangowc, or socket
 [adapter]
-name = "hyprland"
+name = "mangowc"
 
 # Socket adapter (for external bridges)
 # [adapter]
@@ -85,6 +86,8 @@ Script paths in `exec` and `script` fields are resolved as follows:
 1. **Absolute path** (`/usr/local/bin/notify.sh`) - executed directly
 2. **Relative path** (`wallpaper.sh`) - joined with `scripts_dir`
 
+If `scripts_dir` itself is relative, it is resolved relative to the config file's directory.
+
 Default `scripts_dir`: `~/.config/middlesox/scripts`
 
 | `exec` value | `scripts_dir` | Resolved path |
@@ -111,6 +114,9 @@ if current == "master" {
 
 1. **Positional argument** (`$1`): Full JSON payload
 2. **Environment variables**: `MSX_EVENT`, `MSX_PREV`, `MSX_CURR`
+
+`.sh` files must include a shebang because Middlesox executes them directly.
+For `msx exec <name>`, shell commands receive `{"event":"command","prev":null,"curr":null}`.
 
 ```bash
 #!/bin/bash
@@ -140,6 +146,8 @@ msx stop                   # Stop daemon
 msx status                 # Check if running
 msx get workspace          # Query value
 msx set layout grid        # Set value
+msx caps                   # List capabilities
+msx commands               # List named commands
 msx exec cycle_layout      # Run named command
 ```
 
@@ -149,11 +157,16 @@ msx exec cycle_layout      # Run named command
 impl ProtocolAdapter for MyBackend {
     fn name(&self) -> &str;
     fn manifest(&self) -> CapabilityManifest;
-    async fn listen(&self, tx: Sender<RawEvent>, subs: HashSet<String>) -> Result<()>;
-    async fn get(&self, key: &str) -> Result<Value>;
-    async fn set(&self, key: &str, value: Value) -> Result<()>;
+    async fn subscribe(&mut self, subscriptions: HashSet<String>) -> Result<()>;
+    async fn next_event(&mut self) -> Result<Option<RawEvent>>;
+    async fn get(&mut self, key: &str) -> Result<Value>;
+    async fn set(&mut self, key: &str, value: Value) -> Result<()>;
+    async fn init(&mut self) -> Result<()> { Ok(()) }
+    async fn shutdown(&mut self) -> Result<()> { Ok(()) }
 }
 ```
+
+`next_event()` is polled inside `tokio::select!`, so it must be cancel-safe. Backends that read from non-cancel-safe sources should bridge them through an internal task or thread and return events via `mpsc::Receiver::recv()`.
 
 ## License
 

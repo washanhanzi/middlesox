@@ -3,16 +3,12 @@
 //! This backend simulates workspace changes and layout toggles,
 //! allowing development and testing of the event pipeline and scripting.
 
-use crate::adapter::ProtocolAdapter;
-use crate::capability::{Capability, CapabilityManifest};
-use crate::event::RawEvent;
+use middlesox::{Capability, CapabilityManifest, ProtocolAdapter, RawEvent};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Interval};
 use tracing::{debug, info};
 
 /// A mock protocol adapter that simulates window manager events.
@@ -21,22 +17,31 @@ use tracing::{debug, info};
 /// without needing a running window manager or compositor.
 pub struct MockBackend {
     /// Current workspace (1-10)
-    workspace: AtomicI64,
+    workspace: i64,
     /// Current layout ("master", "grid", "float")
-    layout: RwLock<String>,
-    /// Whether the backend is running
-    running: AtomicBool,
+    layout: String,
     /// Event generation interval in milliseconds
     event_interval_ms: u64,
+    /// Subscribed event names
+    subscriptions: HashSet<String>,
+    /// Tick interval (initialized on subscribe)
+    tick: Option<Interval>,
+    /// Event cycle counter
+    cycle: u64,
+    /// Whether the backend has been shut down
+    shutdown: bool,
 }
 
 impl MockBackend {
     pub fn new() -> Self {
         Self {
-            workspace: AtomicI64::new(1),
-            layout: RwLock::new("master".into()),
-            running: AtomicBool::new(false),
+            workspace: 1,
+            layout: "master".into(),
             event_interval_ms: 2000,
+            subscriptions: HashSet::new(),
+            tick: None,
+            cycle: 0,
+            shutdown: false,
         }
     }
 
@@ -44,11 +49,6 @@ impl MockBackend {
     pub fn with_interval(mut self, ms: u64) -> Self {
         self.event_interval_ms = ms;
         self
-    }
-
-    /// Stop the event loop.
-    pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -84,40 +84,38 @@ impl ProtocolAdapter for MockBackend {
             )
     }
 
-    async fn listen(
-        &self,
-        event_tx: mpsc::Sender<RawEvent>,
-        subscriptions: HashSet<String>,
-    ) -> Result<()> {
-        self.running.store(true, Ordering::SeqCst);
-        let mut tick = interval(Duration::from_millis(self.event_interval_ms));
-        let mut cycle = 0u64;
-
+    async fn subscribe(&mut self, subscriptions: HashSet<String>) -> Result<()> {
         info!(
-            "Mock backend started, subscribed to: {:?}",
+            "Mock backend subscribed to: {:?}",
             subscriptions.iter().collect::<Vec<_>>()
         );
+        self.subscriptions = subscriptions;
+        self.tick = Some(interval(Duration::from_millis(self.event_interval_ms)));
+        Ok(())
+    }
 
-        if subscriptions.is_empty() {
-            info!("No subscriptions, mock backend idle");
-            // Just wait for shutdown
-            while self.running.load(Ordering::SeqCst) {
-                tick.tick().await;
-            }
-            return Ok(());
+    async fn next_event(&mut self) -> Result<Option<RawEvent>> {
+        if self.shutdown {
+            return Ok(None);
         }
 
-        while self.running.load(Ordering::SeqCst) {
-            tick.tick().await;
-            cycle += 1;
+        let tick = self.tick.as_mut().expect("subscribe() must be called before next_event()");
 
-            // Generate events based on cycle, but only emit if subscribed
-            let event = match cycle % 3 {
-                0 if subscriptions.contains("workspace_change") => {
-                    // Workspace change: prev -> curr transition
-                    let prev_ws = self.workspace.load(Ordering::SeqCst);
-                    let curr_ws = (prev_ws % 4) + 1; // Cycle through 1-4
-                    self.workspace.store(curr_ws, Ordering::SeqCst);
+        if self.subscriptions.is_empty() {
+            // No subscriptions — just wait until shutdown
+            std::future::pending::<()>().await;
+            return Ok(None);
+        }
+
+        loop {
+            tick.tick().await;
+            self.cycle += 1;
+
+            let event = match self.cycle % 3 {
+                0 if self.subscriptions.contains("workspace_change") => {
+                    let prev_ws = self.workspace;
+                    let curr_ws = (prev_ws % 4) + 1;
+                    self.workspace = curr_ws;
 
                     debug!("Mock: workspace {} -> {}", prev_ws, curr_ws);
 
@@ -128,54 +126,46 @@ impl ProtocolAdapter for MockBackend {
                             .with_curr("monitor", "MOCK-1"),
                     )
                 }
-                1 if subscriptions.contains("window_update") => {
-                    // Window count update (curr state only)
-                    let count = (cycle % 5) as i64 + 1;
+                1 if self.subscriptions.contains("window_update") => {
+                    let count = (self.cycle % 5) as i64 + 1;
                     debug!("Mock: window_count = {}", count);
 
                     Some(
                         RawEvent::new("window_update")
                             .with_curr("window_count", count)
-                            .with_curr("workspace", self.workspace.load(Ordering::SeqCst)),
+                            .with_curr("workspace", self.workspace),
                     )
                 }
-                2 if subscriptions.contains("layout_hint") => {
-                    // Layout hint (curr state only)
-                    let layout = self.layout.read().await.clone();
+                2 if self.subscriptions.contains("layout_hint") => {
+                    let layout = self.layout.clone();
                     debug!("Mock: layout_hint = {}", layout);
 
                     Some(
                         RawEvent::new("layout_hint")
                             .with_curr("layout", layout)
-                            .with_curr("workspace", self.workspace.load(Ordering::SeqCst)),
+                            .with_curr("workspace", self.workspace),
                     )
                 }
-                _ => None, // Not subscribed or no event this cycle
+                _ => None,
             };
 
             if let Some(event) = event {
-                if event_tx.send(event).await.is_err() {
-                    info!("Mock backend: event channel closed, stopping");
-                    break;
-                }
+                return Ok(Some(event));
             }
         }
-
-        info!("Mock backend stopped");
-        Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Value> {
+    async fn get(&mut self, key: &str) -> Result<Value> {
         match key {
-            "workspace" => Ok(Value::from(self.workspace.load(Ordering::SeqCst))),
-            "layout" => Ok(Value::from(self.layout.read().await.clone())),
+            "workspace" => Ok(Value::from(self.workspace)),
+            "layout" => Ok(Value::from(self.layout.clone())),
             "monitor" => Ok(Value::from("MOCK-1")),
             "window_count" => Ok(Value::from(3)), // Simulated
             _ => Err(anyhow!("Unknown key: {}", key)),
         }
     }
 
-    async fn set(&self, key: &str, value: Value) -> Result<()> {
+    async fn set(&mut self, key: &str, value: Value) -> Result<()> {
         match key {
             "workspace" => {
                 let ws = value
@@ -185,7 +175,7 @@ impl ProtocolAdapter for MockBackend {
                     return Err(anyhow!("workspace must be 1-10"));
                 }
                 info!("Mock: SET workspace = {}", ws);
-                self.workspace.store(ws, Ordering::SeqCst);
+                self.workspace = ws;
                 Ok(())
             }
             "layout" => {
@@ -197,7 +187,7 @@ impl ProtocolAdapter for MockBackend {
                     return Err(anyhow!("layout must be one of: {:?}", valid));
                 }
                 info!("Mock: SET layout = {}", layout);
-                *self.layout.write().await = layout.to_string();
+                self.layout = layout.to_string();
                 Ok(())
             }
             "monitor" | "window_count" => {
@@ -207,10 +197,15 @@ impl ProtocolAdapter for MockBackend {
         }
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        self.stop();
+    async fn shutdown(&mut self) -> Result<()> {
+        self.shutdown = true;
         Ok(())
     }
+}
+
+/// Create a mock backend instance.
+pub fn create_backend() -> Box<dyn ProtocolAdapter> {
+    Box::new(MockBackend::new())
 }
 
 #[cfg(test)]
@@ -219,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_get_set() {
-        let backend = MockBackend::new();
+        let mut backend = MockBackend::new();
 
         // Test get
         let ws = backend.get("workspace").await.unwrap();
@@ -238,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_readonly() {
-        let backend = MockBackend::new();
+        let mut backend = MockBackend::new();
 
         // Should fail on read-only
         let result = backend.set("monitor", Value::from("test")).await;

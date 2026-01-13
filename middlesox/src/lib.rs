@@ -14,6 +14,8 @@
 //!
 //! - **Protocol Layer**: The `ProtocolAdapter` trait defines the interface
 //!   that WM/compositor backends must implement.
+//! - **Adapter Handle**: `AdapterHandle` provides channel-based access to
+//!   the adapter actor task (owns the adapter, no shared access needed).
 //! - **Capability System**: Backends declare what they support via `Capability`
 //!   and `CapabilityManifest`.
 //! - **Event Pipeline**: `RawEvent`s flow from backends through the state
@@ -22,46 +24,17 @@
 //!   enforcement.
 
 mod adapter;
+pub mod adapter_handle;
 mod capability;
 mod event;
 
-#[cfg(feature = "mock")]
-mod mock;
-
 pub mod config;
 pub mod control;
+pub mod controller;
 pub mod engine;
 
 // Core protocol types
 pub use adapter::{BoxedAdapter, ProtocolAdapter};
+pub use adapter_handle::AdapterHandle;
 pub use capability::{AccessMode, Capability, CapabilityManifest};
 pub use event::RawEvent;
-
-// Mock backend (dev/testing only)
-#[cfg(feature = "mock")]
-pub use mock::MockBackend;
-
-/// Create a built-in backend by name.
-///
-/// Available backends depend on enabled features:
-/// - "mock": Simulated backend for testing (requires `mock` feature)
-///
-/// For real WM backends, use the separate crates:
-/// - `middlesox-hyprland` for Hyprland
-/// - `middlesox-mangowc` for MangoWC/dwl
-pub fn create_backend(name: &str) -> Option<BoxedAdapter> {
-    match name {
-        #[cfg(feature = "mock")]
-        "mock" => Some(Box::new(MockBackend::new())),
-        _ => None,
-    }
-}
-
-/// List all available built-in backend names.
-#[allow(unused_mut)]
-pub fn available_backends() -> Vec<&'static str> {
-    let mut backends = Vec::new();
-    #[cfg(feature = "mock")]
-    backends.push("mock");
-    backends
-}

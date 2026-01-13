@@ -12,16 +12,16 @@
 //!
 //! # Protocol (JSON Lines)
 //!
-//! ## Commands (Middlesox → Bridge)
+//! ## Commands (Middlesox -> Bridge)
 //!
 //! ```json
-//! {"id": 1, "method": "get", "key": "workspace"}
-//! {"id": 2, "method": "set", "key": "layout", "value": "grid"}
+//! {"id": 1, "method": "get", "params": {"key": "workspace"}}
+//! {"id": 2, "method": "set", "params": {"key": "layout", "value": "grid"}}
 //! {"id": 3, "method": "caps"}
-//! {"id": 4, "method": "subscribe", "events": ["workspace_change"]}
+//! {"id": 4, "method": "subscribe", "params": {"events": ["workspace_change"]}}
 //! ```
 //!
-//! ## Responses (Bridge → Middlesox)
+//! ## Responses (Bridge -> Middlesox)
 //!
 //! ```json
 //! {"id": 1, "result": {"id": 2, "name": "main"}}
@@ -29,7 +29,7 @@
 //! {"id": 3, "error": "unknown key"}
 //! ```
 //!
-//! ## Events (Bridge → Middlesox, no id)
+//! ## Events (Bridge -> Middlesox, no id)
 //!
 //! ```json
 //! {"event": "workspace_change", "prev": {"id": 1}, "curr": {"id": 2}}
@@ -44,11 +44,17 @@ use protocol::{Request, Response};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
+
+/// Timeout for command round-trips to the bridge process.
+const BRIDGE_CMD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for the subscribe handshake (connect + ack).
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Socket-based protocol adapter.
 ///
@@ -60,9 +66,11 @@ pub struct SocketAdapter {
     /// Socket for events (push from bridge)
     event_socket: PathBuf,
     /// Request ID counter
-    next_id: AtomicU64,
+    next_id: u64,
     /// Cached capabilities (fetched once)
-    cached_caps: tokio::sync::OnceCell<CapabilityManifest>,
+    cached_caps: Option<CapabilityManifest>,
+    /// Internal event receiver (from reader task)
+    event_rx: Option<mpsc::Receiver<RawEvent>>,
 }
 
 impl SocketAdapter {
@@ -75,8 +83,9 @@ impl SocketAdapter {
         Self {
             cmd_socket: cmd_socket.into(),
             event_socket: event_socket.into(),
-            next_id: AtomicU64::new(1),
-            cached_caps: tokio::sync::OnceCell::new(),
+            next_id: 1,
+            cached_caps: None,
+            event_rx: None,
         }
     }
 
@@ -87,74 +96,90 @@ impl SocketAdapter {
     /// - `{base}-events.sock` for events
     pub fn from_base_path(base: impl AsRef<Path>) -> Self {
         let base = base.as_ref();
-        let cmd = base.with_extension("sock");
+        let cmd = PathBuf::from(format!("{}.sock", base.display()));
         let event = PathBuf::from(format!("{}-events.sock", base.display()));
         Self::new(cmd, event)
     }
 
     /// Send a request and wait for response.
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-
-        let request = Request {
-            id,
-            method: method.to_string(),
-            params,
-        };
-
+    async fn send(&mut self, request: Request) -> Result<Value> {
+        let id = request.id;
         debug!("Sending request: {:?}", request);
 
-        // Connect to command socket
-        let mut stream = UnixStream::connect(&self.cmd_socket)
-            .await
-            .with_context(|| format!("Failed to connect to {}", self.cmd_socket.display()))?;
+        let result = tokio::time::timeout(BRIDGE_CMD_TIMEOUT, async {
+            // Connect to command socket
+            let mut stream = UnixStream::connect(&self.cmd_socket)
+                .await
+                .with_context(|| format!("Failed to connect to {}", self.cmd_socket.display()))?;
 
-        // Send request
-        let mut line = serde_json::to_string(&request)?;
-        line.push('\n');
-        stream.write_all(line.as_bytes()).await?;
+            // Send request
+            let mut line = serde_json::to_string(&request)?;
+            line.push('\n');
+            stream.write_all(line.as_bytes()).await?;
 
-        // Read response
-        let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader.read_line(&mut response_line).await?;
+            // Read response
+            let mut reader = BufReader::new(stream);
+            let mut response_line = String::new();
+            reader.read_line(&mut response_line).await?;
 
-        let response: Response = serde_json::from_str(&response_line)
-            .with_context(|| format!("Invalid response: {}", response_line.trim()))?;
+            let response: Response = serde_json::from_str(&response_line)
+                .with_context(|| format!("Invalid response: {}", response_line.trim()))?;
 
-        debug!("Received response: {:?}", response);
+            debug!("Received response: {:?}", response);
 
-        // Verify ID matches
-        if response.id != id {
-            return Err(anyhow!(
-                "Response ID mismatch: expected {}, got {}",
-                id,
-                response.id
-            ));
+            // Verify ID matches
+            if response.id != id {
+                return Err(anyhow!(
+                    "Response ID mismatch: expected {}, got {}",
+                    id,
+                    response.id
+                ));
+            }
+
+            // Check for error
+            if let Some(err) = response.error {
+                return Err(anyhow!("Bridge error: {}", err));
+            }
+
+            Ok(response.result.unwrap_or(Value::Null))
+        })
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(anyhow!(
+                "Bridge did not respond within {}s",
+                BRIDGE_CMD_TIMEOUT.as_secs()
+            )),
         }
+    }
 
-        // Check for error
-        if let Some(err) = response.error {
-            return Err(anyhow!("Bridge error: {}", err));
-        }
-
-        Ok(response.result.unwrap_or(Value::Null))
+    /// Get the next request ID.
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     /// Fetch capabilities from the bridge.
-    async fn fetch_capabilities(&self) -> Result<CapabilityManifest> {
-        let result = self.request("caps", Value::Null).await?;
+    async fn fetch_capabilities(&mut self) -> Result<CapabilityManifest> {
+        let id = self.next_id();
+        let result = self.send(Request::caps(id)).await?;
 
         let caps: Vec<CapabilityInfo> =
             serde_json::from_value(result).context("Invalid capabilities response")?;
 
         let mut manifest = CapabilityManifest::new();
         for cap in caps {
-            // Map access string to capability constructor
-            // "rw" or "read_write" -> read_write, everything else -> read_only
-            let capability = match cap.access.as_str() {
+            // Map access string to capability constructor (case-insensitive)
+            let capability = match cap.access.to_lowercase().as_str() {
                 "rw" | "read_write" | "readwrite" => Capability::read_write(&cap.name),
-                _ => Capability::read_only(&cap.name),
+                access => {
+                    if access != "ro" && access != "read_only" && access != "readonly" {
+                        warn!("Unknown access mode '{}' for capability '{}', defaulting to read-only", cap.access, cap.name);
+                    }
+                    Capability::read_only(&cap.name)
+                }
             };
 
             let capability = if let Some(desc) = cap.description {
@@ -186,117 +211,155 @@ impl ProtocolAdapter for SocketAdapter {
     }
 
     fn manifest(&self) -> CapabilityManifest {
-        // Return cached caps or empty manifest
-        // (actual fetch happens async, so we cache on first get/set)
         self.cached_caps
-            .get()
-            .cloned()
+            .clone()
             .unwrap_or_else(CapabilityManifest::new)
     }
 
-    async fn listen(
-        &self,
-        event_tx: mpsc::Sender<RawEvent>,
-        subscriptions: HashSet<String>,
-    ) -> Result<()> {
-        // Connect to event socket
-        let stream = UnixStream::connect(&self.event_socket)
-            .await
-            .with_context(|| format!("Failed to connect to {}", self.event_socket.display()))?;
+    async fn init(&mut self) -> Result<()> {
+        // Pre-fetch and cache capabilities from the bridge
+        if self.cached_caps.is_none() {
+            self.cached_caps = Some(self.fetch_capabilities().await?);
+        }
+        Ok(())
+    }
 
-        debug!("Connected to event socket: {}", self.event_socket.display());
+    async fn subscribe(&mut self, subscriptions: HashSet<String>) -> Result<()> {
+        // Connect, send subscribe request, and read ack — all under a single timeout
+        let (reader, subscriptions_clone) = tokio::time::timeout(SUBSCRIBE_TIMEOUT, async {
+            let stream = UnixStream::connect(&self.event_socket)
+                .await
+                .with_context(|| format!("Failed to connect to {}", self.event_socket.display()))?;
 
-        // Send subscribe request
-        let sub_request = Request {
-            id: 0,
-            method: "subscribe".to_string(),
-            params: serde_json::json!({
-                "events": subscriptions.iter().collect::<Vec<_>>()
-            }),
-        };
+            debug!("Connected to event socket: {}", self.event_socket.display());
 
-        let (reader, mut writer) = stream.into_split();
+            let events: Vec<&str> = subscriptions.iter().map(|s| s.as_str()).collect();
+            let sub_request = Request::subscribe(0, &events);
 
-        let mut line = serde_json::to_string(&sub_request)?;
-        line.push('\n');
-        writer.write_all(line.as_bytes()).await?;
+            let (reader, mut writer) = stream.into_split();
+
+            let mut line = serde_json::to_string(&sub_request)?;
+            line.push('\n');
+            writer.write_all(line.as_bytes()).await?;
+
+            // Read and validate subscription acknowledgment
+            let mut buf_reader = BufReader::new(reader);
+            let mut response_line = String::new();
+            buf_reader.read_line(&mut response_line).await
+                .context("Failed to read subscribe response from bridge")?;
+            let response: Response = serde_json::from_str(response_line.trim())
+                .context("Invalid subscribe response from bridge")?;
+            if let Some(err) = response.error {
+                return Err(anyhow!("Bridge rejected subscription: {}", err));
+            }
+            let reader = buf_reader.into_inner();
+
+            Ok::<_, anyhow::Error>((reader, subscriptions))
+        })
+        .await
+        .map_err(|_| anyhow!(
+            "Subscribe handshake timed out after {}s",
+            SUBSCRIBE_TIMEOUT.as_secs()
+        ))??;
+
+        let subscriptions = subscriptions_clone;
 
         debug!("Subscribed to events: {:?}", subscriptions);
 
-        // Read events in a loop
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+        // Spawn an internal reader task that pushes events into an mpsc channel.
+        // This makes next_event() cancel-safe (read_line isn't cancel-safe).
+        let (event_tx, event_rx) = mpsc::channel::<RawEvent>(100);
+        self.event_rx = Some(event_rx);
 
-        loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line).await?;
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
 
-            if bytes_read == 0 {
-                // EOF - socket closed
-                warn!("Event socket closed");
-                break;
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Parse event
-            match serde_json::from_str::<protocol::Event>(trimmed) {
-                Ok(event) => {
-                    debug!("Received event: {:?}", event);
-
-                    let raw_event = RawEvent::new(event.event)
-                        .with_prev_state(event.prev.map(json_object_to_hashmap).unwrap_or_default())
-                        .with_curr_state(
-                            event.curr.map(json_object_to_hashmap).unwrap_or_default(),
-                        );
-
-                    if event_tx.send(raw_event).await.is_err() {
-                        // Receiver dropped
-                        debug!("Event channel closed");
+            loop {
+                line.clear();
+                let bytes_read = match reader.read_line(&mut line).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("Event socket read error: {}", e);
                         break;
                     }
+                };
+
+                if bytes_read == 0 {
+                    warn!("Event socket closed");
+                    break;
                 }
-                Err(e) => {
-                    // Might be a response to subscribe, skip it
-                    if trimmed.contains("\"id\"") {
-                        debug!("Skipping response: {}", trimmed);
-                    } else {
-                        error!("Failed to parse event: {} - {}", e, trimmed);
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                match serde_json::from_str::<protocol::Event>(trimmed) {
+                    Ok(event) => {
+                        debug!("Received event: {:?}", event);
+
+                        let mut raw_event = RawEvent::new(event.event);
+                        if let Some(prev) = event.prev {
+                            raw_event = raw_event.with_prev_state(json_object_to_hashmap(prev));
+                        }
+                        if let Some(curr) = event.curr {
+                            raw_event = raw_event.with_curr_state(json_object_to_hashmap(curr));
+                        }
+
+                        if event_tx.send(raw_event).await.is_err() {
+                            debug!("Event channel closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if trimmed.contains("\"id\"") {
+                            debug!("Skipping response: {}", trimmed);
+                        } else {
+                            error!("Failed to parse event: {} - {}", e, trimmed);
+                        }
                     }
                 }
             }
+        });
+
+        Ok(())
+    }
+
+    async fn next_event(&mut self) -> Result<Option<RawEvent>> {
+        let rx = self.event_rx.as_mut()
+            .ok_or_else(|| anyhow!("subscribe() must be called before next_event()"))?;
+
+        match rx.recv().await {
+            Some(event) => Ok(Some(event)),
+            None => Ok(None), // Reader task exited
+        }
+    }
+
+    async fn get(&mut self, key: &str) -> Result<Value> {
+        // Ensure caps are cached
+        if self.cached_caps.is_none() {
+            self.cached_caps = Some(self.fetch_capabilities().await?);
         }
 
+        let id = self.next_id();
+        self.send(Request::get(id, key)).await
+    }
+
+    async fn set(&mut self, key: &str, value: Value) -> Result<()> {
+        // Ensure caps are cached
+        if self.cached_caps.is_none() {
+            self.cached_caps = Some(self.fetch_capabilities().await?);
+        }
+
+        let id = self.next_id();
+        self.send(Request::set(id, key, value)).await?;
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Value> {
-        // Ensure caps are cached
-        let _ = self
-            .cached_caps
-            .get_or_try_init(|| self.fetch_capabilities())
-            .await;
-
-        self.request("get", serde_json::json!({"key": key})).await
-    }
-
-    async fn set(&self, key: &str, value: Value) -> Result<()> {
-        // Ensure caps are cached
-        let _ = self
-            .cached_caps
-            .get_or_try_init(|| self.fetch_capabilities())
-            .await;
-
-        self.request("set", serde_json::json!({"key": key, "value": value}))
-            .await?;
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        // Nothing to clean up - connections are per-request
+    async fn shutdown(&mut self) -> Result<()> {
+        // Drop event receiver to signal reader task to stop
+        self.event_rx = None;
         Ok(())
     }
 }

@@ -4,7 +4,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
-use tokio::sync::mpsc;
 
 /// The core trait that all window manager backends must implement.
 ///
@@ -18,11 +17,14 @@ use tokio::sync::mpsc;
 ///
 /// Each adapter is responsible for:
 /// 1. Declaring its capabilities (what it can read/write)
-/// 2. Listening for WM events and forwarding them
+/// 2. Subscribing to and yielding WM events
 /// 3. Querying WM state
 /// 4. Executing commands against the WM
+///
+/// Only the adapter actor task calls these methods, so `&mut self` is
+/// sufficient — no shared access or interior mutability needed.
 #[async_trait]
-pub trait ProtocolAdapter: Send + Sync {
+pub trait ProtocolAdapter: Send {
     /// Returns the name of this adapter (e.g., "mangowc", "hyprland").
     fn name(&self) -> &str;
 
@@ -32,25 +34,25 @@ pub trait ProtocolAdapter: Send + Sync {
     /// operations and by the core to understand available features.
     fn manifest(&self) -> CapabilityManifest;
 
-    /// Start the event loop, pushing subscribed events to the provided channel.
+    /// Subscribe to the given set of events.
     ///
-    /// This method should run indefinitely, listening for WM/compositor
-    /// events and converting them to `RawEvent` instances. Only events
-    /// whose names are in `subscriptions` should be emitted.
+    /// Called once after construction. The adapter should set up whatever
+    /// internal state is needed to produce events matching `subscriptions`
+    /// via [`next_event`](Self::next_event).
+    async fn subscribe(&mut self, subscriptions: HashSet<String>) -> Result<()>;
+
+    /// Yield the next event from the backend.
     ///
-    /// # Arguments
-    /// * `event_tx` - Channel sender for emitting events to the core
-    /// * `subscriptions` - Set of event names to subscribe to. Only emit
-    ///   events whose names are in this set. If empty, emit nothing.
+    /// Returns `Ok(Some(event))` when an event is available, or
+    /// `Ok(None)` when the event source is exhausted (e.g., connection closed).
     ///
-    /// # Returns
-    /// * `Ok(())` if the loop exits gracefully (e.g., shutdown signal)
-    /// * `Err(_)` if there's a connection error or fatal failure
-    async fn listen(
-        &self,
-        event_tx: mpsc::Sender<RawEvent>,
-        subscriptions: HashSet<String>,
-    ) -> Result<()>;
+    /// # Cancel-safety
+    ///
+    /// This method is called inside `tokio::select!` in the adapter actor.
+    /// Implementations **must** be cancel-safe. Strategies:
+    /// - Use `tokio::time::Interval::tick()` (cancel-safe)
+    /// - Use `mpsc::Receiver::recv()` with an internal reader task
+    async fn next_event(&mut self) -> Result<Option<RawEvent>>;
 
     /// Query a value from the window manager.
     ///
@@ -60,7 +62,7 @@ pub trait ProtocolAdapter: Send + Sync {
     /// # Returns
     /// * `Ok(Value)` with the current value
     /// * `Err(_)` if the key is unknown or query fails
-    async fn get(&self, key: &str) -> Result<Value>;
+    async fn get(&mut self, key: &str) -> Result<Value>;
 
     /// Set a value in the window manager.
     ///
@@ -75,13 +77,22 @@ pub trait ProtocolAdapter: Send + Sync {
     /// # Security Note
     /// The core's security layer validates write permissions before
     /// calling this method. Adapters should still validate inputs.
-    async fn set(&self, key: &str, value: Value) -> Result<()>;
+    async fn set(&mut self, key: &str, value: Value) -> Result<()>;
+
+    /// Initialize the adapter.
+    ///
+    /// Called after construction but before the main event loop.
+    /// Adapters that discover capabilities lazily (e.g., socket adapter
+    /// fetching from a bridge) should pre-fetch and cache them here.
+    async fn init(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Gracefully shutdown the adapter.
     ///
     /// Called when the controller is shutting down. Adapters should
     /// close connections and clean up resources.
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(&mut self) -> Result<()> {
         Ok(())
     }
 }

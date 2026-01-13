@@ -2,16 +2,77 @@
 default_to_workspace = false
 
 [tasks.dev]
-description = "Build middlesox-cli and install to ~/.local/bin"
+description = "Build, install, configure, and run msx locally"
 script = '''
+set -eu
+
 cargo build --release -p middlesox-cli
-cp target/release/msx ~/.local/bin/msx
-echo "Installed msx to ~/.local/bin/msx"
+
+mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${SCRIPTS_DIR}"
+install -m 0755 target/release/msx "${BIN_DIR}/msx"
+cp -f example/config.toml "${CONFIG_FILE}"
+cp -a example/scripts/. "${SCRIPTS_DIR}/"
+
+echo "Installed msx to ${BIN_DIR}/msx"
+echo "Copied example config to ${CONFIG_FILE}"
+echo "Copied example scripts to ${SCRIPTS_DIR}"
+systemctl --user stop middlesox.service 2>/dev/null || true
+"${BIN_DIR}/msx" --config "${CONFIG_FILE}" run
 '''
 
-[tasks.run]
-description = "Build and run msx with example config"
+[tasks.dev.env]
+BIN_DIR = "${HOME}/.local/bin"
+CONFIG_DIR = "${HOME}/.config/middlesox"
+CONFIG_FILE = "${CONFIG_DIR}/config.toml"
+SCRIPTS_DIR = "${CONFIG_DIR}/scripts"
+
+[tasks.install-service]
+description = "Build, install, configure, create user service if missing, and restart msx"
 script = '''
+set -eu
+
 cargo build --release -p middlesox-cli
-./target/release/msx --config ./example/config.toml run
+
+mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${SCRIPTS_DIR}" "${SYSTEMD_USER_DIR}"
+install -m 0755 target/release/msx "${BIN_DIR}/msx"
+cp -f example/config.toml "${CONFIG_FILE}"
+cp -a example/scripts/. "${SCRIPTS_DIR}/"
+
+if [ ! -e "${SERVICE_FILE}" ]; then
+    cat > "${SERVICE_FILE}" <<EOF
+[Unit]
+Description=Middlesox window manager automation daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=${BIN_DIR}/msx --config ${CONFIG_FILE} run
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+    echo "Created user service ${SERVICE_FILE}"
+else
+    echo "User service already exists: ${SERVICE_FILE}"
+fi
+
+systemctl --user daemon-reload
+systemctl --user enable middlesox.service
+systemctl --user restart middlesox.service
+
+echo "Installed msx to ${BIN_DIR}/msx"
+echo "Copied config to ${CONFIG_FILE}"
+echo "Copied scripts to ${SCRIPTS_DIR}"
+echo "Restarted middlesox.service"
 '''
+
+[tasks.install-service.env]
+BIN_DIR = "${HOME}/.local/bin"
+CONFIG_DIR = "${HOME}/.config/middlesox"
+CONFIG_FILE = "${CONFIG_DIR}/config.toml"
+SCRIPTS_DIR = "${CONFIG_DIR}/scripts"
+SYSTEMD_USER_DIR = "${HOME}/.config/systemd/user"
+SERVICE_FILE = "${SYSTEMD_USER_DIR}/middlesox.service"

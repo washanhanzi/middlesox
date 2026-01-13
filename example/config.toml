@@ -3,7 +3,7 @@ name = "mangowc"
 
 [settings]
 log_level = "debug"
-scripts_dir = "./example/scripts"
+scripts_dir = "scripts"
 
 [[watch]]
 event="tag_change"
@@ -12,6 +12,14 @@ exec="echo.sh"
 [[watch]]
 event="layout_change"
 exec="layout_notify.sh"
+
+[[watch]]
+event="focus_change"
+exec="keyd_appmap.sh"
+
+[[watch]]
+event="output_focus"
+exec="keyd_appmap.sh"
 
 [[command]]
 name = "cycle_layout"

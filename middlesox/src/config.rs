@@ -35,7 +35,10 @@ pub struct Config {
 /// Global settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    /// Directory containing scripts (relative to config file)
+    /// Directory containing scripts.
+    ///
+    /// Absolute paths and `~` paths are used as-is.
+    /// Relative paths are resolved relative to the config file's directory.
     #[serde(default = "default_scripts_dir")]
     pub scripts_dir: String,
 
@@ -46,8 +49,9 @@ pub struct Settings {
 
 /// Adapter configuration.
 ///
-/// Strongly typed enum for each supported adapter.
-/// Each variant contains adapter-specific configuration.
+/// The core is adapter-agnostic — it only stores the adapter name and
+/// any adapter-specific options as a freeform table. The CLI binary
+/// interprets the name and options to construct the concrete adapter.
 ///
 /// # Examples
 ///
@@ -65,71 +69,29 @@ pub struct Settings {
 ///
 /// [adapter]
 /// name = "socket"
-/// base_path = "/run/user/1000/my-bridge"  # derives both sockets
+/// base_path = "/run/user/1000/my-bridge"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "name", rename_all = "lowercase")]
-pub enum AdapterConfig {
-    /// Mock adapter for testing (no external dependencies)
-    Mock,
+pub struct AdapterConfig {
+    /// Adapter name (e.g., "mock", "mangowc", "hyprland", "socket").
+    #[serde(default = "default_adapter_name")]
+    pub name: String,
 
-    /// Hyprland compositor adapter
-    Hyprland,
-
-    /// MangoWC/dwl compositor adapter
-    Mangowc,
-
-    /// Socket-based adapter for external bridge implementations
-    Socket(SocketAdapterConfig),
+    /// Adapter-specific options (freeform key-value pairs).
+    /// Each adapter interprets these differently.
+    #[serde(flatten)]
+    pub options: HashMap<String, toml::Value>,
 }
 
-impl AdapterConfig {
-    /// Get the adapter name as a string.
-    pub fn name(&self) -> &'static str {
-        match self {
-            AdapterConfig::Mock => "mock",
-            AdapterConfig::Hyprland => "hyprland",
-            AdapterConfig::Mangowc => "mangowc",
-            AdapterConfig::Socket(_) => "socket",
-        }
-    }
+fn default_adapter_name() -> String {
+    "mock".into()
 }
 
 impl Default for AdapterConfig {
     fn default() -> Self {
-        AdapterConfig::Mock
-    }
-}
-
-/// Socket adapter configuration.
-///
-/// Supports two modes:
-/// - Explicit: Provide `cmd_socket` and `event_socket` paths directly
-/// - Base path: Provide `base_path`, derives `{base}.sock` and `{base}-events.sock`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SocketAdapterConfig {
-    /// Explicit socket paths
-    Explicit {
-        cmd_socket: String,
-        event_socket: String,
-    },
-    /// Base path (derives both socket paths)
-    BasePath {
-        base_path: String,
-    },
-}
-
-impl SocketAdapterConfig {
-    /// Get the command and event socket paths.
-    pub fn socket_paths(&self) -> (String, String) {
-        match self {
-            SocketAdapterConfig::Explicit { cmd_socket, event_socket } => {
-                (cmd_socket.clone(), event_socket.clone())
-            }
-            SocketAdapterConfig::BasePath { base_path } => {
-                (format!("{}.sock", base_path), format!("{}-events.sock", base_path))
-            }
+        Self {
+            name: default_adapter_name(),
+            options: HashMap::new(),
         }
     }
 }
@@ -205,12 +167,28 @@ fn default_enabled() -> bool {
 
 impl Config {
     /// Load configuration from a TOML file.
+    ///
+    /// Relative `scripts_dir` paths are resolved relative to the config file's
+    /// parent directory.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        Self::parse(&content)
+        let mut config = Self::parse(&content)?;
+
+        // Resolve relative scripts_dir against the config file's parent directory
+        let scripts_path = std::path::Path::new(&config.settings.scripts_dir);
+        if !scripts_path.is_absolute() && !config.settings.scripts_dir.starts_with('~') {
+            if let Some(config_dir) = path.parent() {
+                config.settings.scripts_dir = config_dir
+                    .join(scripts_path)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+
+        Ok(config)
     }
 
     /// Parse configuration from a TOML string.
@@ -246,7 +224,7 @@ impl Config {
     pub fn default_config() -> Self {
         Self {
             settings: Settings::default(),
-            adapter: AdapterConfig::default(),
+            adapter: AdapterConfig::default(), // "mock"
             watch: vec![
                 Watch {
                     event: "workspace_change".into(),
@@ -351,8 +329,7 @@ script = "toggle_layout.rhai"
 "#;
 
         let config = Config::parse(toml).unwrap();
-        assert!(matches!(config.adapter, AdapterConfig::Mock));
-        assert_eq!(config.adapter.name(), "mock");
+        assert_eq!(config.adapter.name, "mock");
         assert_eq!(config.watch.len(), 2);
         assert_eq!(config.watch[0].event, "workspace_change");
         assert_eq!(config.watch[0].prev.get("id"), Some(&Value::from(1)));
@@ -372,15 +349,15 @@ event_socket = "/run/user/1000/bridge-events.sock"
 "#;
 
         let config = Config::parse(toml).unwrap();
-        assert_eq!(config.adapter.name(), "socket");
-
-        if let AdapterConfig::Socket(socket_cfg) = &config.adapter {
-            let (cmd, event) = socket_cfg.socket_paths();
-            assert_eq!(cmd, "/run/user/1000/bridge.sock");
-            assert_eq!(event, "/run/user/1000/bridge-events.sock");
-        } else {
-            panic!("Expected Socket adapter");
-        }
+        assert_eq!(config.adapter.name, "socket");
+        assert_eq!(
+            config.adapter.options.get("cmd_socket").and_then(|v| v.as_str()),
+            Some("/run/user/1000/bridge.sock")
+        );
+        assert_eq!(
+            config.adapter.options.get("event_socket").and_then(|v| v.as_str()),
+            Some("/run/user/1000/bridge-events.sock")
+        );
     }
 
     #[test]
@@ -392,15 +369,11 @@ base_path = "/run/user/1000/bridge"
 "#;
 
         let config = Config::parse(toml).unwrap();
-        assert_eq!(config.adapter.name(), "socket");
-
-        if let AdapterConfig::Socket(socket_cfg) = &config.adapter {
-            let (cmd, event) = socket_cfg.socket_paths();
-            assert_eq!(cmd, "/run/user/1000/bridge.sock");
-            assert_eq!(event, "/run/user/1000/bridge-events.sock");
-        } else {
-            panic!("Expected Socket adapter");
-        }
+        assert_eq!(config.adapter.name, "socket");
+        assert_eq!(
+            config.adapter.options.get("base_path").and_then(|v| v.as_str()),
+            Some("/run/user/1000/bridge")
+        );
     }
 
     #[test]
@@ -411,8 +384,8 @@ name = "hyprland"
 "#;
 
         let config = Config::parse(toml).unwrap();
-        assert!(matches!(config.adapter, AdapterConfig::Hyprland));
-        assert_eq!(config.adapter.name(), "hyprland");
+        assert_eq!(config.adapter.name, "hyprland");
+        assert!(config.adapter.options.is_empty());
     }
 
     #[test]

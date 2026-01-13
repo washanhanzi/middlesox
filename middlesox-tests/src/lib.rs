@@ -3,21 +3,17 @@
 //! Provides utilities to run a daemon with mock backend in an isolated
 //! environment for testing the full CLI/daemon flow.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use middlesox::config::{AdapterConfig, Config, Settings};
 use middlesox::control::{acquire_lock_in, create_listener_at, send_request_to};
-use middlesox::engine::ScriptEngine;
-use middlesox::{BoxedAdapter, MockBackend, RawEvent};
-use std::collections::HashSet;
+use middlesox::controller::Controller;
+use middlesox::AdapterHandle;
+use middlesox_mock::MockBackend;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
 
 // Re-export control types for test convenience
 pub use middlesox::control::{ControlRequest, ControlResponse};
@@ -50,7 +46,10 @@ impl TestHarness {
                 scripts_dir: scripts_dir.to_string_lossy().to_string(),
                 log_level: "debug".into(),
             },
-            adapter: AdapterConfig::Mock,
+            adapter: AdapterConfig {
+                name: "mock".into(),
+                options: Default::default(),
+            },
             watch: vec![],
             command: vec![],
         };
@@ -113,21 +112,21 @@ impl TestHarness {
         let lock_file = acquire_lock_in(&lock_path)?;
         self._lock_file = Some(lock_file);
 
-        // Create backend - single instance shared between engine and listener
-        let backend: BoxedAdapter = Box::new(MockBackend::new());
-
-        // Create engine with the backend
-        let engine = ScriptEngine::new(backend);
-
-        // Get the shared adapter for the event listener
-        let shared_adapter = engine.shared_adapter();
+        // Create backend
+        let backend: Box<dyn middlesox::ProtocolAdapter> = Box::new(MockBackend::new());
 
         let subscriptions = self.config.subscribed_events();
-        let controller = Arc::new(Controller::new(
+
+        // Spawn adapter actor
+        let (adapter_handle, event_rx, _adapter_task) =
+            AdapterHandle::spawn(backend, subscriptions).await?;
+
+        // Create controller
+        let controller = Controller::new(
             self.config.clone(),
-            engine,
+            adapter_handle,
             self.scripts_dir.clone(),
-        ));
+        );
 
         // Create control socket
         let socket_path = self.socket_path();
@@ -138,13 +137,9 @@ impl TestHarness {
         self.shutdown_tx = Some(shutdown_tx);
 
         // Spawn daemon task
-        let handle = tokio::spawn(run_daemon_inner(
-            shared_adapter,
-            subscriptions,
-            controller,
-            control_listener,
-            shutdown_rx,
-        ));
+        let handle = tokio::spawn(async move {
+            controller.run(event_rx, control_listener, shutdown_rx).await;
+        });
         self.daemon_handle = Some(handle);
 
         // Wait a bit for daemon to start
@@ -192,227 +187,3 @@ impl Drop for TestHarness {
         }
     }
 }
-
-// ============================================================================
-// Internal daemon implementation (mirrors middlesox-cli daemon logic)
-// ============================================================================
-
-/// Controller orchestrates the event pipeline and script execution.
-struct Controller {
-    config: Config,
-    engine: Arc<ScriptEngine>,
-    scripts_dir: PathBuf,
-}
-
-impl Controller {
-    fn new(config: Config, engine: ScriptEngine, scripts_dir: PathBuf) -> Self {
-        Self {
-            config,
-            engine: Arc::new(engine),
-            scripts_dir,
-        }
-    }
-
-    async fn handle_event(&self, event: RawEvent) {
-        debug!(
-            "Received event: {} prev={:?} curr={:?}",
-            event.name, event.prev, event.curr
-        );
-
-        let prev = event.prev.clone().unwrap_or_default();
-        let curr = event.curr.clone().unwrap_or_default();
-
-        // Process watches
-        for watch in self.config.watches_for_event(&event.name) {
-            // If no conditions specified, always run (script handles logic)
-            // If conditions specified, check match first
-            let should_run = watch.prev.is_empty() && watch.curr.is_empty()
-                || watch.matches(&prev, &curr);
-
-            if should_run {
-                info!("Watch triggered: {} -> {}", event.name, watch.exec);
-                self.run_script(&watch.exec, &event).await;
-            }
-        }
-    }
-
-    async fn run_script(&self, script_name: &str, event: &RawEvent) {
-        let script_path = self.scripts_dir.join(script_name);
-        if !script_path.exists() {
-            debug!("Script not found: {}", script_path.display());
-            return;
-        }
-
-        match self.engine.execute_file_with_event(&script_path, event).await {
-            Ok(result) => debug!("Script '{}' returned: {:?}", script_name, result),
-            Err(e) => error!("Script '{}' failed: {}", script_name, e),
-        }
-    }
-
-    async fn handle_control(&self, request: ControlRequest) -> ControlResponse {
-        match request {
-            ControlRequest::Get { key } => match self.engine.get(&key).await {
-                Ok(value) => ControlResponse::ok(value),
-                Err(e) => ControlResponse::err(e.to_string()),
-            },
-
-            ControlRequest::Set { key, value } => match self.engine.set(&key, value).await {
-                Ok(()) => ControlResponse::ok_empty(),
-                Err(e) => ControlResponse::err(e.to_string()),
-            },
-
-            ControlRequest::Exec { name } => {
-                let cmd = match self.config.command_by_name(&name) {
-                    Some(c) => c,
-                    None => return ControlResponse::err(format!("Unknown command: {}", name)),
-                };
-
-                let script_path = self.scripts_dir.join(&cmd.script);
-                if !script_path.exists() {
-                    return ControlResponse::err(format!(
-                        "Script not found: {}",
-                        script_path.display()
-                    ));
-                }
-
-                match self.engine.execute_file(&script_path).await {
-                    Ok(result) => {
-                        if result.is_unit() {
-                            ControlResponse::ok_empty()
-                        } else {
-                            ControlResponse::ok(serde_json::json!(format!("{:?}", result)))
-                        }
-                    }
-                    Err(e) => ControlResponse::err(e.to_string()),
-                }
-            }
-
-            ControlRequest::Caps => {
-                let manifest = self.engine.manifest();
-                let caps: Vec<_> = manifest
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "name": c.name,
-                            "access": format!("{:?}", c.access),
-                            "description": c.description,
-                        })
-                    })
-                    .collect();
-                ControlResponse::ok(serde_json::json!(caps))
-            }
-
-            ControlRequest::Commands => {
-                let cmds: Vec<_> = self
-                    .config
-                    .command
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "name": c.name,
-                            "description": c.description,
-                            "script": c.script,
-                        })
-                    })
-                    .collect();
-                ControlResponse::ok(serde_json::json!(cmds))
-            }
-
-            ControlRequest::Status => {
-                let adapter_name = self.engine.adapter_name().await;
-                ControlResponse::ok(serde_json::json!({
-                    "running": true,
-                    "pid": std::process::id(),
-                    "adapter": adapter_name,
-                }))
-            }
-
-            ControlRequest::Stop => ControlResponse::ok_empty(),
-        }
-    }
-}
-
-async fn run_daemon_inner(
-    shared_adapter: Arc<RwLock<BoxedAdapter>>,
-    subscriptions: HashSet<String>,
-    controller: Arc<Controller>,
-    control_listener: UnixListener,
-    shutdown_rx: oneshot::Receiver<()>,
-) {
-    let shutdown_tx = Arc::new(tokio::sync::Mutex::new(None::<oneshot::Sender<()>>));
-
-    // Event channel
-    let (event_tx, mut event_rx) = mpsc::channel::<RawEvent>(100);
-
-    // Spawn event listener using the shared adapter
-    let listener_adapter = shared_adapter.clone();
-    let listener_handle = tokio::spawn(async move {
-        let adapter = listener_adapter.read().await;
-        if let Err(e) = adapter.listen(event_tx, subscriptions).await {
-            error!("Backend listener error: {}", e);
-        }
-    });
-
-    // Spawn event processor
-    let controller_for_events = controller.clone();
-    let event_handle = tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            controller_for_events.handle_event(event).await;
-        }
-    });
-
-    // Spawn control socket handler
-    let controller_for_control = controller.clone();
-    let shutdown_tx_for_control = shutdown_tx.clone();
-    let control_handle = tokio::spawn(async move {
-        loop {
-            match control_listener.accept().await {
-                Ok((stream, _)) => {
-                    let controller = controller_for_control.clone();
-                    let shutdown_tx = shutdown_tx_for_control.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_control_client(stream, controller, shutdown_tx).await
-                        {
-                            debug!("Control client error: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Control socket accept error: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    // Wait for shutdown
-    let _ = shutdown_rx.await;
-
-    // Cleanup
-    listener_handle.abort();
-    event_handle.abort();
-    control_handle.abort();
-}
-
-async fn handle_control_client(
-    stream: UnixStream,
-    controller: Arc<Controller>,
-    _shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>,
-) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-
-    reader.read_line(&mut line).await?;
-    let request: ControlRequest = serde_json::from_str(line.trim())?;
-    debug!("Control request: {:?}", request);
-
-    let response = controller.handle_control(request).await;
-
-    let mut response_line = serde_json::to_string(&response)?;
-    response_line.push('\n');
-    writer.write_all(response_line.as_bytes()).await?;
-
-    Ok(())
-}
-

@@ -57,6 +57,51 @@ Tasks created from the review of `doc/architecture.md`, with adjacent README dri
   Acceptance:
   A backend author following the README would implement the current trait, not a removed one.
 
+- [ ] Document the distinct script timeouts.
+  Scope:
+  Spell out the current timeout constants instead of saying only that scripts have a timeout: event-triggered shell scripts use `SCRIPT_TIMEOUT` at 30s, event-triggered Rhai scripts use `RHAI_SCRIPT_TIMEOUT` at 30s, and synchronous `msx exec` shell scripts use `EXEC_TIMEOUT` at 60s.
+  Note that synchronous Rhai `msx exec` execution does not currently use `EXEC_TIMEOUT`.
+  Targets:
+  `doc/architecture.md`, `README.md`, `middlesox/src/controller.rs`
+  Acceptance:
+  A reader can tell which execution path is bounded by which timeout without reading `controller.rs`.
+
+- [ ] Document the script concurrency cap.
+  Scope:
+  Add the `MAX_CONCURRENT_SCRIPTS = 8` semaphore limit to the Script Execution section.
+  Be explicit that the shared semaphore gates event-triggered Rhai and shell script tasks, not synchronous `msx exec` execution.
+  Targets:
+  `doc/architecture.md`, `README.md`, `middlesox/src/controller.rs`
+  Acceptance:
+  The docs describe both the timeout and concurrency behavior that applies during event storms.
+
+- [ ] Document adapter channel capacities on both sides.
+  Scope:
+  Keep the documented adapter event channel capacity of 100 and add the command channel capacity of 32 used by `AdapterHandle::spawn()`.
+  Place the details near the adapter actor/process model so the event and command paths are described together.
+  Targets:
+  `doc/architecture.md`, `middlesox/src/adapter_handle.rs`
+  Acceptance:
+  The architecture doc no longer documents only the event-side mpsc capacity while omitting the command-side capacity.
+
+- [ ] Clarify the two shutdown signal paths.
+  Scope:
+  Update the shutdown diagram and sequence to distinguish external `shutdown_rx` from Ctrl+C/test harness shutdown and `control_shutdown_rx` from a control-path `stop` request.
+  Preserve the detail that `stop` sends its response before triggering the control shutdown channel.
+  Targets:
+  `doc/architecture.md`, `middlesox/src/controller.rs`, `middlesox-cli/src/main.rs`
+  Acceptance:
+  The shutdown sequence reflects the two oneshot receivers selected by `Controller::run()` rather than flattening them into one path.
+
+- [ ] Document enforced shell shebang validation.
+  Scope:
+  Keep the existing requirement that `.sh` files include a shebang, and add that the controller checks this before execution.
+  Mention the difference in behavior: event-triggered scripts log an error and return, while `msx exec` returns an error response.
+  Targets:
+  `doc/architecture.md`, `README.md`, `middlesox/src/controller.rs`
+  Acceptance:
+  Script authors know the `.sh` shebang rule is enforced by Middlesox, not just recommended.
+
 ## Phase 2: Architecture decisions
 
 - [ ] Decide whether the docs should describe the current split control path, or whether the implementation should be changed to match a unified control model.

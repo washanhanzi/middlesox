@@ -45,6 +45,10 @@ pub struct Settings {
     /// Log level ("trace", "debug", "info", "warn", "error")
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Environment variables passed to executable scripts.
+    #[serde(default)]
+    pub script_env: HashMap<String, String>,
 }
 
 /// Adapter configuration.
@@ -113,6 +117,7 @@ impl Default for Settings {
         Self {
             scripts_dir: default_scripts_dir(),
             log_level: default_log_level(),
+            script_env: HashMap::new(),
         }
     }
 }
@@ -304,6 +309,9 @@ mod tests {
 [settings]
 scripts_dir = "scripts"
 
+[settings.script_env]
+MSX_WALLPAPER_DIR = "~/Pictures/wallpapers"
+
 [adapter]
 name = "mock"
 
@@ -329,6 +337,10 @@ script = "toggle_layout.rhai"
 "#;
 
         let config = Config::parse(toml).unwrap();
+        assert_eq!(
+            config.settings.script_env.get("MSX_WALLPAPER_DIR").map(String::as_str),
+            Some("~/Pictures/wallpapers")
+        );
         assert_eq!(config.adapter.name, "mock");
         assert_eq!(config.watch.len(), 2);
         assert_eq!(config.watch[0].event, "workspace_change");

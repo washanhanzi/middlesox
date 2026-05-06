@@ -253,6 +253,7 @@ impl Controller {
 
         let script_name = script_name.to_string();
         let script_path = script_path.clone();
+        let script_env = self.config.settings.script_env.clone();
         let semaphore = self.script_semaphore.clone();
 
         // Build environment variables and JSON input
@@ -288,17 +289,20 @@ impl Controller {
                 }
             };
 
-            let result = tokio::time::timeout(
-                SCRIPT_TIMEOUT,
-                tokio::process::Command::new(&script_path)
+            let result = tokio::time::timeout(SCRIPT_TIMEOUT, async {
+                let mut command = tokio::process::Command::new(&script_path);
+                command
                     .arg(&input_json)
-                    // Set environment variables for shell scripts
+                    .envs(&script_env)
+                    // Set environment variables for shell scripts.
+                    // Middlesox-owned variables override configured values.
                     .env("MSX_EVENT", &env_event)
                     .env("MSX_PREV", &env_prev)
                     .env("MSX_CURR", &env_curr)
                     .kill_on_drop(true)
-                    .output(),
-            )
+                    .output()
+                    .await
+            })
             .await;
 
             match result {
@@ -387,17 +391,20 @@ impl Controller {
             "curr": null,
         })
         .to_string();
+        let script_env = self.config.settings.script_env.clone();
 
-        let result = tokio::time::timeout(
-            EXEC_TIMEOUT,
-            tokio::process::Command::new(script_path)
+        let result = tokio::time::timeout(EXEC_TIMEOUT, async {
+            let mut command = tokio::process::Command::new(script_path);
+            command
                 .arg(&input_json)
+                .envs(&script_env)
                 .env("MSX_EVENT", "command")
                 .env("MSX_PREV", "null")
                 .env("MSX_CURR", "null")
                 .kill_on_drop(true)
-                .output(),
-        )
+                .output()
+                .await
+        })
         .await;
 
         match result {

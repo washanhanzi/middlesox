@@ -1,5 +1,5 @@
-// Cycle through predefined layouts
-let cycle = ["Tile", "Scroller","Vertical Tile","Vertical Scroller"];
+// Cycle through the layouts bound to the Mango switch-layout shortcut.
+let cycle = ["Tile", "Scroller"];
 
 let current = get("layout_name");
 let next_idx = 0;

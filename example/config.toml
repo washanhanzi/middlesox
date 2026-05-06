@@ -5,21 +5,25 @@ name = "mangowc"
 log_level = "debug"
 scripts_dir = "scripts"
 
-[[watch]]
-event="tag_change"
-exec="echo.sh"
+[settings.script_env]
+MSX_WALLPAPER_DIR = "~/Pictures/active"
 
 [[watch]]
-event="layout_change"
-exec="layout_notify.sh"
+event = "tag_change"
+exec = "random_wallpaper.sh"
+description = "Set a random wallpaper on the active output when workspace tags change"
 
 [[watch]]
-event="focus_change"
-exec="keyd_appmap.sh"
+event = "layout_change"
+exec = "layout_notify.sh"
 
 [[watch]]
-event="output_focus"
-exec="keyd_appmap.sh"
+event = "focus_change"
+exec = "keyd_appmap.sh"
+
+[[watch]]
+event = "output_focus"
+exec = "keyd_appmap.sh"
 
 [[command]]
 name = "cycle_layout"

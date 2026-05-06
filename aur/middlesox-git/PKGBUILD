@@ -2,7 +2,7 @@
 
 pkgname=middlesox-git
 _pkgname=middlesox
-pkgver=0.0.1.r8.g8585785
+pkgver=0.0.1.r10.g264a281
 pkgrel=1
 pkgdesc="Scriptable event-driven controller for window managers and compositors"
 arch=('x86_64')

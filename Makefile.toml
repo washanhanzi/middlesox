@@ -76,3 +76,102 @@ CONFIG_FILE = "${CONFIG_DIR}/config.toml"
 SCRIPTS_DIR = "${CONFIG_DIR}/scripts"
 SYSTEMD_USER_DIR = "${HOME}/.config/systemd/user"
 SERVICE_FILE = "${SYSTEMD_USER_DIR}/middlesox.service"
+
+[tasks.publish-aur]
+description = "Update, verify, and push the middlesox-git AUR package"
+script = '''
+set -eu
+
+repo_dir="$(git rev-parse --show-toplevel)"
+cd "${repo_dir}"
+
+for cmd in git makepkg awk sed mktemp cp; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        echo "Missing required command: ${cmd}" >&2
+        exit 1
+    fi
+done
+
+local_head="$(git rev-parse HEAD)"
+remote_head="$(git ls-remote "${AUR_SOURCE_REMOTE}" HEAD | awk '{ print $1 }')"
+if [ -z "${remote_head}" ]; then
+    echo "Could not read HEAD from ${AUR_SOURCE_REMOTE}" >&2
+    exit 1
+fi
+
+if [ "${local_head}" != "${remote_head}" ]; then
+    echo "Refusing to publish: local HEAD is not ${AUR_SOURCE_REMOTE}/HEAD" >&2
+    echo "local:  ${local_head}" >&2
+    echo "remote: ${remote_head}" >&2
+    exit 1
+fi
+
+aur_dir="${repo_dir}/${AUR_PACKAGE_DIR}"
+pkgbuild="${aur_dir}/PKGBUILD"
+srcinfo="${aur_dir}/.SRCINFO"
+
+for file in "${pkgbuild}" "${srcinfo}" "${aur_dir}/LICENSE" "${aur_dir}/.gitignore"; do
+    if [ ! -f "${file}" ]; then
+        echo "Missing AUR package file: ${file}" >&2
+        exit 1
+    fi
+done
+
+version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+if [ -z "${version}" ]; then
+    echo "Could not read workspace package version from Cargo.toml" >&2
+    exit 1
+fi
+
+pkgver="${version}.r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)"
+sed -i "s/^pkgver=.*/pkgver=${pkgver}/" "${pkgbuild}"
+
+(
+    cd "${aur_dir}"
+    makepkg --printsrcinfo > .SRCINFO
+
+    if [ "${AUR_RUN_MAKEPKG:-1}" != "0" ]; then
+        makepkg_git_config="${AUR_MAKEPKG_GIT_CONFIG:-${HOME}/.gitconfig}"
+        if [ -n "${makepkg_git_config}" ]; then
+            export MAKEPKG_GIT_CONFIG="${makepkg_git_config}"
+        fi
+        makepkg --clean --cleanbuild --force --noconfirm
+    else
+        echo "Skipping makepkg build because AUR_RUN_MAKEPKG=0"
+    fi
+)
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/middlesox-git-aur.XXXXXX")"
+trap 'rm -rf "${tmp_dir}"' EXIT
+aur_checkout="${tmp_dir}/repo"
+
+git clone "${AUR_REPO}" "${aur_checkout}"
+for file in PKGBUILD .SRCINFO LICENSE .gitignore; do
+    cp "${aur_dir}/${file}" "${aur_checkout}/${file}"
+done
+
+(
+    cd "${aur_checkout}"
+    git add PKGBUILD .SRCINFO LICENSE .gitignore
+
+    if git diff --cached --quiet; then
+        echo "AUR package is already up to date: ${pkgver}"
+        exit 0
+    fi
+
+    if git rev-parse --verify HEAD >/dev/null 2>&1; then
+        commit_message="${AUR_COMMIT_MESSAGE:-update middlesox-git to ${pkgver}}"
+    else
+        commit_message="${AUR_COMMIT_MESSAGE:-initial import}"
+    fi
+
+    git commit -m "${commit_message}"
+    git push origin HEAD:"${AUR_BRANCH}"
+)
+'''
+
+[tasks.publish-aur.env]
+AUR_PACKAGE_DIR = "aur/middlesox-git"
+AUR_REPO = "ssh://aur@aur.archlinux.org/middlesox-git.git"
+AUR_BRANCH = "master"
+AUR_SOURCE_REMOTE = "origin"

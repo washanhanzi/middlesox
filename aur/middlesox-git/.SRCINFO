@@ -1,6 +1,6 @@
 pkgbase = middlesox-git
 	pkgdesc = Scriptable event-driven controller for window managers and compositors
-	pkgver = 0.0.1.r8.g8585785
+	pkgver = 0.0.1.r10.g264a281
 	pkgrel = 1
 	url = https://github.com/washanhanzi/middlesox
 	arch = x86_64
@@ -11,7 +11,7 @@ pkgbase = middlesox-git
 	depends = gcc-libs
 	depends = glibc
 	depends = wayland
-	provides = middlesox=0.0.1.r8.g8585785
+	provides = middlesox=0.0.1.r10.g264a281
 	provides = msx
 	conflicts = middlesox
 	conflicts = msx

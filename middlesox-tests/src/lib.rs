@@ -45,6 +45,7 @@ impl TestHarness {
             settings: Settings {
                 scripts_dir: scripts_dir.to_string_lossy().to_string(),
                 log_level: "debug".into(),
+                script_env: Default::default(),
             },
             adapter: AdapterConfig {
                 name: "mock".into(),

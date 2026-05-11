@@ -27,14 +27,6 @@ if [[ -z "$appid" && "$event_name" == "command" ]]; then
     fi
 fi
 
-if [[ -z "$appid" ]]; then
-    printf 'keyd_appmap: skipped empty appid appid_origin=%s previous_appid=%s event=%s\n' \
-        "$appid_origin" \
-        "${previous_appid:-<empty>}" \
-        "$event_name"
-    exit 0
-fi
-
 if [[ "$appid" == "$previous_appid" ]]; then
     exit 0
 fi

@@ -27,7 +27,7 @@ pub struct TestHarness {
     /// Configuration for the test daemon.
     config: Config,
     /// Handle to the daemon task.
-    daemon_handle: Option<JoinHandle<()>>,
+    daemon_handle: Option<JoinHandle<Result<()>>>,
     /// Shutdown signal sender.
     shutdown_tx: Option<oneshot::Sender<()>>,
     /// Lock file (kept open to maintain lock).
@@ -139,7 +139,7 @@ impl TestHarness {
 
         // Spawn daemon task
         let handle = tokio::spawn(async move {
-            controller.run(event_rx, control_listener, shutdown_rx).await;
+            controller.run(event_rx, control_listener, shutdown_rx).await
         });
         self.daemon_handle = Some(handle);
 

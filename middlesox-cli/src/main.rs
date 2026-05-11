@@ -265,12 +265,12 @@ async fn run_daemon(config: Config) -> Result<()> {
     });
 
     // Run the main event loop (blocks until shutdown)
-    controller.run(event_rx, control_listener, shutdown_rx).await;
+    let run_result = controller.run(event_rx, control_listener, shutdown_rx).await;
 
     // Cleanup
     control::cleanup_socket();
 
-    Ok(())
+    run_result
 }
 
 #[tokio::main]

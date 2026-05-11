@@ -15,18 +15,24 @@ if [[ -f "$state_file" ]]; then
     previous_appid="$(< "$state_file")"
 fi
 
+event_name="${MSX_EVENT:-command}"
 event_appid="$(jq -r '.appid // .curr.appid // ""' <<< "${MSX_CURR:-null}")"
-if [[ -n "$event_appid" && "$event_appid" == "$previous_appid" ]]; then
-    exit 0
-fi
+appid="$event_appid"
+appid_origin="event"
 
-appid=""
-if output="$("$msx_bin" get appid 2>/dev/null)"; then
-    appid="$(jq -r '. // ""' <<< "$output" 2>/dev/null || true)"
+if [[ -z "$appid" && "$event_name" == "command" ]]; then
+    appid_origin="query"
+    if output="$("$msx_bin" get appid 2>/dev/null)"; then
+        appid="$(jq -r '. // ""' <<< "$output" 2>/dev/null || true)"
+    fi
 fi
 
 if [[ -z "$appid" ]]; then
-    appid="$event_appid"
+    printf 'keyd_appmap: skipped empty appid appid_origin=%s previous_appid=%s event=%s\n' \
+        "$appid_origin" \
+        "${previous_appid:-<empty>}" \
+        "$event_name"
+    exit 0
 fi
 
 if [[ "$appid" == "$previous_appid" ]]; then
@@ -45,3 +51,8 @@ case "$appid" in
 esac
 
 printf '%s\n' "$appid" > "$state_file"
+printf 'keyd_appmap: appid=%s appid_origin=%s previous_appid=%s event=%s\n' \
+    "${appid:-<empty>}" \
+    "$appid_origin" \
+    "${previous_appid:-<empty>}" \
+    "$event_name"

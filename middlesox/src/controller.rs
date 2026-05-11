@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::control::{ControlRequest, ControlResponse};
 use crate::engine::ScriptEngine;
 use crate::RawEvent;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,7 +78,7 @@ impl Controller {
         mut event_rx: mpsc::Receiver<RawEvent>,
         control_listener: UnixListener,
         mut shutdown_rx: oneshot::Receiver<()>,
-    ) {
+    ) -> Result<()> {
         let controller = Arc::new(self);
 
         // Create a second shutdown channel for control-path stop requests
@@ -86,6 +86,8 @@ impl Controller {
         let shutdown_tx = Arc::new(tokio::sync::Mutex::new(Some(control_shutdown_tx)));
 
         info!("Daemon running. Use 'msx stop' or Ctrl+C to stop.");
+
+        let mut run_result = Ok(());
 
         loop {
             tokio::select! {
@@ -97,6 +99,7 @@ impl Controller {
                         }
                         None => {
                             debug!("Event channel closed");
+                            run_result = Err(anyhow!("adapter event stream ended unexpectedly"));
                             break;
                         }
                     }
@@ -116,6 +119,7 @@ impl Controller {
                         }
                         Err(e) => {
                             error!("Control socket accept error: {}", e);
+                            run_result = Err(e.into());
                             break;
                         }
                     }
@@ -138,8 +142,12 @@ impl Controller {
         info!("Shutting down...");
         if let Err(e) = controller.adapter.shutdown().await {
             warn!("Adapter shutdown error: {}", e);
+            if run_result.is_ok() {
+                run_result = Err(e);
+            }
         }
         info!("Middlesox stopped");
+        run_result
     }
 
     /// Process an incoming event.

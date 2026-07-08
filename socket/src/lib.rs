@@ -213,7 +213,7 @@ impl ProtocolAdapter for SocketAdapter {
     fn manifest(&self) -> CapabilityManifest {
         self.cached_caps
             .clone()
-            .unwrap_or_else(CapabilityManifest::new)
+            .unwrap_or_default()
     }
 
     async fn init(&mut self) -> Result<()> {

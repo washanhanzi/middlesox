@@ -157,11 +157,16 @@ impl Controller {
             event.name, event.prev, event.curr
         );
 
+        let watches = self.config.watches_for_event(&event.name);
+        if watches.is_empty() {
+            return;
+        }
+
         let prev = event.prev.clone().unwrap_or_default();
         let curr = event.curr.clone().unwrap_or_default();
 
         // Process watches
-        for watch in self.config.watches_for_event(&event.name) {
+        for watch in watches {
             // If no conditions specified, always run (script handles logic)
             // If conditions specified, check match first
             let should_run = (watch.prev.is_empty() && watch.curr.is_empty())
@@ -182,7 +187,7 @@ impl Controller {
         }
 
         // Check if it's a Rhai script or a shell command
-        if script_path.extension().map_or(false, |ext| ext == "rhai") {
+        if script_path.extension().is_some_and(|ext| ext == "rhai") {
             // Fire-and-forget with timeout and concurrency limit
             let engine = self.engine.clone();
             let script_name = script_name.to_string();
@@ -236,21 +241,20 @@ impl Controller {
     ///
     /// Bounded by a concurrency semaphore and execution timeout to prevent
     /// resource exhaustion under event storms.
-    async fn run_shell_script(&self, script_path: &PathBuf, script_name: &str, event: Option<&RawEvent>) {
+    async fn run_shell_script(&self, script_path: &std::path::Path, script_name: &str, event: Option<&RawEvent>) {
         debug!("Spawning command: {}", script_path.display());
 
         // Validate shebang for .sh files
-        if script_path.extension().map_or(false, |ext| ext == "sh") {
-            match std::fs::read(script_path) {
-                Ok(content) => {
-                    if !content.starts_with(b"#!") {
-                        error!(
-                            "Script '{}' is missing a shebang line (e.g., #!/bin/bash). \
-                             This will cause 'Exec format error' on execution.",
-                            script_path.display()
-                        );
-                        return;
-                    }
+        if script_path.extension().is_some_and(|ext| ext == "sh") {
+            match has_shebang(script_path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    error!(
+                        "Script '{}' is missing a shebang line (e.g., #!/bin/bash). \
+                         This will cause 'Exec format error' on execution.",
+                        script_path.display()
+                    );
+                    return;
                 }
                 Err(e) => {
                     error!("Failed to read script '{}': {}", script_path.display(), e);
@@ -260,7 +264,7 @@ impl Controller {
         }
 
         let script_name = script_name.to_string();
-        let script_path = script_path.clone();
+        let script_path = script_path.to_path_buf();
         let script_env = self.config.settings.script_env.clone();
         let semaphore = self.script_semaphore.clone();
 
@@ -351,7 +355,7 @@ impl Controller {
         }
 
         // Check if it's a Rhai script or a shell command
-        if script_path.extension().map_or(false, |ext| ext == "rhai") {
+        if script_path.extension().is_some_and(|ext| ext == "rhai") {
             // Execute as Rhai script
             match self.engine.execute_file(&script_path).await {
                 Ok(result) => {
@@ -372,19 +376,18 @@ impl Controller {
     /// Execute a shell script synchronously and return the result.
     ///
     /// Bounded by execution timeout to prevent runaway processes.
-    async fn execute_shell_script(&self, script_path: &PathBuf, script_name: &str) -> Result<Option<String>, String> {
+    async fn execute_shell_script(&self, script_path: &std::path::Path, script_name: &str) -> Result<Option<String>, String> {
         debug!("Executing command: {}", script_path.display());
 
         // Validate shebang for .sh files
-        if script_path.extension().map_or(false, |ext| ext == "sh") {
-            match std::fs::read(script_path) {
-                Ok(content) => {
-                    if !content.starts_with(b"#!") {
-                        return Err(format!(
-                            "Script '{}' is missing a shebang line (e.g., #!/bin/bash)",
-                            script_path.display()
-                        ));
-                    }
+        if script_path.extension().is_some_and(|ext| ext == "sh") {
+            match has_shebang(script_path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "Script '{}' is missing a shebang line (e.g., #!/bin/bash)",
+                        script_path.display()
+                    ));
                 }
                 Err(e) => {
                     return Err(format!("Failed to read script '{}': {}", script_path.display(), e));
@@ -541,6 +544,18 @@ impl Controller {
     }
 }
 
+/// Check whether a script starts with a `#!` shebang, reading only the
+/// first two bytes.
+fn has_shebang(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut buf = [0u8; 2];
+    match std::fs::File::open(path)?.read_exact(&mut buf) {
+        Ok(()) => Ok(&buf == b"#!"),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Handle a single control client connection.
 async fn handle_control_client(
     stream: tokio::net::UnixStream,
@@ -565,11 +580,10 @@ async fn handle_control_client(
     writer.write_all(response_line.as_bytes()).await?;
 
     // If stop was requested, trigger shutdown
-    if is_stop {
-        if let Some(tx) = shutdown_tx.lock().await.take() {
+    if is_stop
+        && let Some(tx) = shutdown_tx.lock().await.take() {
             let _ = tx.send(());
         }
-    }
 
     Ok(())
 }

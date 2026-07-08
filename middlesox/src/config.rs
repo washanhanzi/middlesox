@@ -184,14 +184,13 @@ impl Config {
 
         // Resolve relative scripts_dir against the config file's parent directory
         let scripts_path = std::path::Path::new(&config.settings.scripts_dir);
-        if !scripts_path.is_absolute() && !config.settings.scripts_dir.starts_with('~') {
-            if let Some(config_dir) = path.parent() {
+        if !scripts_path.is_absolute() && !config.settings.scripts_dir.starts_with('~')
+            && let Some(config_dir) = path.parent() {
                 config.settings.scripts_dir = config_dir
                     .join(scripts_path)
                     .to_string_lossy()
                     .into_owned();
             }
-        }
 
         Ok(config)
     }

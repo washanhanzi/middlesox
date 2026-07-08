@@ -24,17 +24,23 @@ struct EventContext {
 /// Wraps Rhai and validates all operations against the capability
 /// manifest before allowing them to execute. The manifest is fetched
 /// from the adapter handle on each security check.
+///
+/// The Rhai engine is built once (with `get`/`set`/logging functions
+/// registered) and shared across executions; per-run state lives in
+/// the `Scope`.
 pub struct ScriptEngine {
-    adapter: AdapterHandle,
+    engine: std::sync::Arc<Engine>,
 }
 
 impl ScriptEngine {
     /// Create a new script engine with the given adapter handle.
     pub fn new(adapter: AdapterHandle) -> Self {
-        Self { adapter }
+        Self {
+            engine: std::sync::Arc::new(Self::create_engine(adapter)),
+        }
     }
 
-    fn create_engine() -> Engine {
+    fn create_engine(adapter: AdapterHandle) -> Engine {
         let mut engine = Engine::new();
 
         // Disable potentially dangerous operations
@@ -43,6 +49,86 @@ impl ScriptEngine {
         engine.set_max_array_size(1_000);
         engine.set_max_map_size(500);
         engine.set_max_operations(100_000);
+
+        // Clone for closures
+        let adapter_get = adapter.clone();
+        let adapter_set = adapter;
+
+        // Register the `get` function
+        engine.register_fn("get", move |key: &str| -> Dynamic {
+            let adapter = adapter_get.clone();
+            let key = key.to_string();
+
+            // Scripts run in spawn_blocking, so a runtime context is available
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                match adapter.get(&key).await {
+                    Ok(value) => json_to_dynamic(value),
+                    Err(e) => {
+                        error!("Script get('{}') failed: {}", key, e);
+                        Dynamic::UNIT
+                    }
+                }
+            })
+        });
+
+        // Register the `set` function with security enforcement.
+        // Returns "" on success or an error message string on failure.
+        engine.register_fn("set", move |key: &str, value: Dynamic| -> String {
+            let adapter = adapter_set.clone();
+            let key = key.to_string();
+            let rt = tokio::runtime::Handle::current();
+
+            // Fetch manifest from adapter
+            let manifest = match rt.block_on(adapter.manifest()) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Script set('{}') failed to get manifest: {}", key, e);
+                    return format!("failed to get manifest: {}", e);
+                }
+            };
+
+            // Security check: validate against manifest
+            let capability = match manifest.find(&key) {
+                Some(cap) => cap.clone(),
+                None => {
+                    warn!("Script tried to set unknown key: {}", key);
+                    return format!("unknown key: {}", key);
+                }
+            };
+
+            if !capability.is_writable() {
+                warn!(
+                    "Security violation: script tried to write read-only key '{}'",
+                    key
+                );
+                return format!("read-only key: {}", key);
+            }
+
+            let json_value = dynamic_to_json(value);
+
+            rt.block_on(async {
+                match adapter.set(&key, json_value).await {
+                    Ok(()) => {
+                        debug!("Script set('{}') succeeded", key);
+                        String::new()
+                    }
+                    Err(e) => {
+                        error!("Script set('{}') failed: {}", key, e);
+                        format!("adapter error: {}", e)
+                    }
+                }
+            })
+        });
+
+        // Register logging functions
+        engine.register_fn("print", |msg: &str| {
+            debug!("Script: {}", msg);
+        });
+
+        engine.register_fn("log", |msg: &str| {
+            debug!("Script log: {}", msg);
+        });
 
         engine
     }
@@ -76,12 +162,12 @@ impl ScriptEngine {
     }
 
     async fn execute_with_context(&self, script: &str, context: Option<EventContext>) -> Result<Dynamic> {
-        let adapter = self.adapter.clone();
+        let engine = self.engine.clone();
         let script = script.to_string();
 
         // Run the script in a blocking task since Rhai isn't async
         let result = tokio::task::spawn_blocking(move || {
-            Self::execute_sync(&script, adapter, context)
+            Self::execute_sync(&engine, &script, context)
         })
         .await
         .map_err(|e| anyhow!("Script task panicked: {}", e))??;
@@ -90,13 +176,10 @@ impl ScriptEngine {
     }
 
     fn execute_sync(
+        engine: &Engine,
         script: &str,
-        adapter: AdapterHandle,
         context: Option<EventContext>,
     ) -> Result<Dynamic> {
-        let rt = tokio::runtime::Handle::current();
-
-        let mut engine = Self::create_engine();
         let mut scope = Scope::new();
 
         // Inject event context if provided
@@ -105,84 +188,6 @@ impl ScriptEngine {
             scope.push("prev", json_map_to_dynamic(ctx.prev));
             scope.push("curr", json_map_to_dynamic(ctx.curr));
         }
-
-        // Clone for closures
-        let adapter_get = adapter.clone();
-        let adapter_set = adapter.clone();
-
-        // Register the `get` function
-        engine.register_fn("get", move |key: &str| -> Dynamic {
-            let adapter = adapter_get.clone();
-            let key = key.to_string();
-
-            rt.block_on(async {
-                match adapter.get(&key).await {
-                    Ok(value) => json_to_dynamic(value),
-                    Err(e) => {
-                        error!("Script get('{}') failed: {}", key, e);
-                        Dynamic::UNIT
-                    }
-                }
-            })
-        });
-
-        // Register the `set` function with security enforcement.
-        // Returns "" on success or an error message string on failure.
-        let rt2 = tokio::runtime::Handle::current();
-        engine.register_fn("set", move |key: &str, value: Dynamic| -> String {
-            let adapter = adapter_set.clone();
-            let key = key.to_string();
-
-            // Fetch manifest from adapter
-            let manifest = match rt2.block_on(adapter.manifest()) {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Script set('{}') failed to get manifest: {}", key, e);
-                    return format!("failed to get manifest: {}", e);
-                }
-            };
-
-            // Security check: validate against manifest
-            let capability = match manifest.find(&key) {
-                Some(cap) => cap.clone(),
-                None => {
-                    warn!("Script tried to set unknown key: {}", key);
-                    return format!("unknown key: {}", key);
-                }
-            };
-
-            if !capability.is_writable() {
-                warn!(
-                    "Security violation: script tried to write read-only key '{}'",
-                    key
-                );
-                return format!("read-only key: {}", key);
-            }
-
-            let json_value = dynamic_to_json(value);
-
-            rt2.block_on(async {
-                match adapter.set(&key, json_value).await {
-                    Ok(()) => {
-                        debug!("Script set('{}') succeeded", key);
-                        String::new()
-                    }
-                    Err(e) => {
-                        error!("Script set('{}') failed: {}", key, e);
-                        format!("adapter error: {}", e)
-                    }
-                }
-            })
-        });
-
-        // Register logging functions
-        engine.register_fn("print", |msg: &str| {
-            debug!("Script: {}", msg);
-        });
-
-        engine.register_fn("log", |msg: &str| {
-            debug!("Script log: {}", msg);
-        });
 
         // Run the script
         let result = engine.eval_with_scope::<Dynamic>(&mut scope, script);

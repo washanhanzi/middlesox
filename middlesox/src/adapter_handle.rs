@@ -119,7 +119,7 @@ impl AdapterHandle {
     /// Shut down the adapter gracefully.
     pub async fn shutdown(&self) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        // Use try_send since the task may already be gone
+        // The task may already be gone; treat a closed channel as success
         if self
             .cmd_tx
             .send(AdapterCommand::Shutdown { reply: reply_tx })

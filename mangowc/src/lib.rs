@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use middlesox::{Capability, CapabilityManifest, ProtocolAdapter, RawEvent};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use wayland_client::protocol::wl_output::WlOutput;
@@ -293,6 +294,48 @@ enum WaylandCommand {
     Shutdown,
 }
 
+/// Sends commands to the Wayland thread, waking its (otherwise blocked)
+/// poll via an eventfd after each send so commands are handled immediately.
+struct CommandSender {
+    tx: std::sync::mpsc::Sender<WaylandCommand>,
+    wake: Arc<OwnedFd>,
+}
+
+impl CommandSender {
+    fn send(
+        &self,
+        cmd: WaylandCommand,
+    ) -> std::result::Result<(), std::sync::mpsc::SendError<WaylandCommand>> {
+        self.tx.send(cmd)?;
+        self.notify();
+        Ok(())
+    }
+
+    fn notify(&self) {
+        let one: u64 = 1;
+        let ret = unsafe {
+            libc::write(
+                self.wake.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if ret < 0 {
+            warn!(
+                "Failed to wake Wayland thread: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+impl Drop for CommandSender {
+    fn drop(&mut self) {
+        // Wake the loop so it can observe the disconnected channel and exit.
+        self.notify();
+    }
+}
+
 /// State for the Wayland event loop.
 struct WaylandState {
     /// The zdwl_ipc_manager global.
@@ -435,13 +478,12 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                     }
                 }
             }
-            wl_registry::Event::GlobalRemove { name } => {
-                if state.outputs.contains_key(&name) {
+            wl_registry::Event::GlobalRemove { name }
+                if state.outputs.contains_key(&name) => {
                     let (output_name, _, _) = state.outputs.remove(&name).unwrap();
                     state.state.outputs.remove(&output_name);
                     info!("Output removed: {}", output_name);
                 }
-            }
             _ => {}
         }
     }
@@ -499,16 +541,14 @@ impl Dispatch<WlOutput, u32> for WaylandState {
                 }
 
                 // Now bind the IPC output if we have the manager and haven't bound yet
-                if let Some(manager) = &state.manager {
-                    if let Some((_, wl_output, ipc_opt)) = state.outputs.get(&output_id) {
-                        if ipc_opt.is_none() {
+                if let Some(manager) = &state.manager
+                    && let Some((_, wl_output, ipc_opt)) = state.outputs.get(&output_id)
+                        && ipc_opt.is_none() {
                             let ipc_output = manager.get_output(wl_output, qh, output_id);
                             if let Some((_, _, old_ipc)) = state.outputs.get_mut(&output_id) {
                                 *old_ipc = Some(ipc_output);
                             }
                         }
-                    }
-                }
             }
             Event::Done => {
                 debug!("Output done event");
@@ -622,7 +662,7 @@ impl Dispatch<ZdwlIpcOutputV2, u32> for WaylandState {
                 // Convert WEnum<TagState> to u32
                 let state_val = match tag_state {
                     wayland_client::WEnum::Value(v) => v as u32,
-                    wayland_client::WEnum::Unknown(v) => v as u32,
+                    wayland_client::WEnum::Unknown(v) => v,
                 };
                 if (tag as usize) < pending.tag_info.len() {
                     pending.tag_info[tag as usize] = TagInfo {
@@ -976,9 +1016,10 @@ impl Dispatch<ZdwlIpcOutputV2, u32> for WaylandState {
 /// Connects to dwl-based compositors using native Wayland protocols.
 /// The Wayland connection runs in a dedicated blocking thread; get/set
 /// communicate with it via a command channel stored in the struct.
+#[derive(Default)]
 pub struct MangoWcBackend {
     /// Command sender to the Wayland thread (initialized on subscribe).
-    cmd_tx: Option<std::sync::mpsc::Sender<WaylandCommand>>,
+    cmd_tx: Option<CommandSender>,
     /// Event receiver from the Wayland thread (initialized on subscribe).
     event_rx: Option<mpsc::Receiver<RawEvent>>,
 }
@@ -1001,6 +1042,7 @@ impl MangoWcBackend {
     /// Run the blocking Wayland event loop (called from spawn_blocking).
     fn run_wayland_loop(
         cmd_rx: std::sync::mpsc::Receiver<WaylandCommand>,
+        wake: Arc<OwnedFd>,
         event_tx: mpsc::Sender<RawEvent>,
         subscriptions: HashSet<String>,
         init_tx: tokio::sync::oneshot::Sender<Result<()>>,
@@ -1075,8 +1117,16 @@ impl MangoWcBackend {
         // Run the event loop
         let fd = conn.as_fd();
         loop {
-            // Check for commands (non-blocking)
-            while let Ok(cmd) = cmd_rx.try_recv() {
+            // Drain queued commands (non-blocking)
+            loop {
+                let cmd = match cmd_rx.try_recv() {
+                    Ok(cmd) => cmd,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        info!("Command channel closed, exiting Wayland event loop");
+                        return Ok(());
+                    }
+                };
                 match cmd {
                     WaylandCommand::SetTags {
                         tagmask,
@@ -1152,39 +1202,52 @@ impl MangoWcBackend {
             // Flush outgoing requests
             conn.flush().map_err(|e| anyhow!("Flush failed: {}", e))?;
 
-            // Wait for events with timeout (to check commands periodically)
-            use std::os::unix::io::AsRawFd;
-            let mut pollfd = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
+            // Block until a Wayland event arrives or a command wakes us
+            let mut fds = [
+                libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
 
-            let ret = unsafe { libc::poll(&mut pollfd, 1, 100) }; // 100ms timeout
+            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
 
-            if ret > 0 {
-                // Dispatch events
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(anyhow!("Poll failed: {}", err));
+            }
+
+            if fds[1].revents != 0 {
+                // Clear the eventfd counter; commands are drained at loop top
+                let mut count = 0u64;
+                unsafe {
+                    libc::read(
+                        wake.as_raw_fd(),
+                        &mut count as *mut u64 as *mut libc::c_void,
+                        std::mem::size_of::<u64>(),
+                    );
+                }
+            }
+
+            if fds[0].revents != 0 {
+                // Dispatch events (also surfaces connection errors via POLLHUP/POLLERR)
                 event_queue
                     .blocking_dispatch(&mut wayland_state)
                     .map_err(|e| anyhow!("Dispatch failed: {}", e))?;
-            } else if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(anyhow!("Poll failed: {}", err));
-                }
             }
         }
     }
 }
 
-impl Default for MangoWcBackend {
-    fn default() -> Self {
-        Self {
-            cmd_tx: None,
-            event_rx: None,
-        }
-    }
-}
 
 #[async_trait]
 impl ProtocolAdapter for MangoWcBackend {
@@ -1245,7 +1308,20 @@ impl ProtocolAdapter for MangoWcBackend {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WaylandCommand>();
         let (event_tx, event_rx) = mpsc::channel::<RawEvent>(100);
 
-        self.cmd_tx = Some(cmd_tx);
+        // Eventfd used to wake the Wayland thread's poll when a command is sent
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if wake_fd < 0 {
+            return Err(anyhow!(
+                "Failed to create eventfd: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(wake_fd) });
+
+        self.cmd_tx = Some(CommandSender {
+            tx: cmd_tx,
+            wake: wake.clone(),
+        });
         self.event_rx = Some(event_rx);
 
         // Oneshot to propagate startup success/failure back to subscribe()
@@ -1253,7 +1329,7 @@ impl ProtocolAdapter for MangoWcBackend {
 
         // Spawn the blocking Wayland event loop in a dedicated thread
         tokio::task::spawn_blocking(move || {
-            match Self::run_wayland_loop(cmd_rx, event_tx, subscriptions, init_tx) {
+            match Self::run_wayland_loop(cmd_rx, wake, event_tx, subscriptions, init_tx) {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::error!("Wayland event loop error: {}", e);
@@ -1439,7 +1515,10 @@ impl ProtocolAdapter for MangoWcBackend {
             debug!("Sending shutdown command to Wayland thread");
             match tx.send(WaylandCommand::Shutdown) {
                 Ok(()) => debug!("Shutdown command sent successfully"),
-                Err(e) => warn!("Failed to send shutdown command: {}", e),
+                // A closed channel means the Wayland thread already exited
+                // (e.g. the compositor connection dropped), so there is
+                // nothing left to shut down.
+                Err(_) => debug!("Wayland thread already exited; skipping shutdown command"),
             }
         } else {
             debug!("No Wayland state found (backend may not have started)");

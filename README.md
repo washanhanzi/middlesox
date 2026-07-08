@@ -6,9 +6,8 @@ events, and trigger Rhai or executable scripts when those events match your
 configuration.
 
 It is designed around adapters: `mock` for tests and local development,
-`mangowc` for MangoWC/dwl-style Wayland control, and `socket` for external IPC
-bridges. The `hyprland` crate exists, but the CLI currently reports it as not
-implemented; use the socket adapter with a Hyprland bridge for now.
+`mangowc` for MangoWC/dwl-style Wayland control, `hyprland` for the Hyprland
+compositor (native socket IPC), and `socket` for external IPC bridges.
 
 ## What It Does
 
@@ -78,7 +77,7 @@ msx daemon
         |
         | ProtocolAdapter
         v
-mock | mangowc | socket | hyprland stub
+mock | mangowc | hyprland | socket
 ```
 
 For a deeper process and event-flow description, see
@@ -101,7 +100,12 @@ scripts_dir = "scripts" # relative to this config file
 log_level = "info"      # trace, debug, info, warn, error
 
 [adapter]
-name = "mangowc"        # mock | mangowc | socket
+name = "mangowc"        # mock | mangowc | hyprland | socket
+
+# Hyprland adapter (sockets discovered from HYPRLAND_INSTANCE_SIGNATURE):
+# [adapter]
+# name = "hyprland"
+# socket_dir = "/run/user/1000/hypr/<signature>"  # optional override
 
 # Socket adapter for external bridges:
 # [adapter]
@@ -235,7 +239,7 @@ Use `--config <path>` with `msx run` to choose the daemon config explicitly.
 | `mock` | `middlesox-mock` | Mock adapter for tests and local development |
 | `mangowc` | `middlesox-mangowc` | MangoWC/dwl Wayland adapter |
 | `socket` | `middlesox-socket` | Unix socket adapter for external bridge processes |
-| `hyprland` | `middlesox-hyprland` | Hyprland adapter crate, currently stubbed |
+| `hyprland` | `middlesox-hyprland` | Hyprland adapter using native socket IPC |
 
 ## Adding an Adapter
 

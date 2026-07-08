@@ -77,7 +77,7 @@ ProtocolAdapter
 ├── MockBackend      — synthetic events for testing
 ├── MangoWcBackend   — dwl/MangoWC via zdwl_ipc Wayland protocol
 ├── SocketAdapter    — bridges external processes via Unix sockets
-└── HyprlandBackend  — (stub)
+└── HyprlandBackend  — Hyprland via .socket.sock / .socket2.sock IPC
 ```
 
 The trait:
@@ -244,4 +244,4 @@ script = "cycle_layout.rhai"
 | `mock` | `middlesox-mock` | Mock adapter for testing |
 | `mangowc` | `middlesox-mangowc` | MangoWC/dwl Wayland adapter |
 | `socket` | `middlesox-socket` | Socket-based external bridge adapter |
-| `hyprland` | `middlesox-hyprland` | Hyprland adapter crate (currently stubbed) |
+| `hyprland` | `middlesox-hyprland` | Hyprland adapter using native socket IPC |

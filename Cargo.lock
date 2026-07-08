@@ -404,6 +404,7 @@ dependencies = [
  "dirs",
  "libc",
  "middlesox",
+ "middlesox-hyprland",
  "middlesox-mangowc",
  "middlesox-mock",
  "middlesox-socket",
@@ -424,6 +425,7 @@ dependencies = [
  "middlesox",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

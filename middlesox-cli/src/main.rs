@@ -116,11 +116,10 @@ fn find_config_path() -> Option<PathBuf> {
 
 /// Expand path with tilde expansion.
 fn expand_path(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
+    if path.starts_with("~/")
+        && let Some(home) = dirs::home_dir() {
             return home.join(&path[2..]);
         }
-    }
     PathBuf::from(path)
 }
 
@@ -136,11 +135,10 @@ fn parse_value(s: &str) -> Value {
     }
 
     // Try as float
-    if let Ok(f) = s.parse::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(f) {
+    if let Ok(f) = s.parse::<f64>()
+        && let Some(n) = serde_json::Number::from_f64(f) {
             return Value::Number(n);
         }
-    }
 
     // Try as boolean
     match s.to_lowercase().as_str() {
@@ -158,10 +156,14 @@ fn create_backend_from_config(adapter: &middlesox::config::AdapterConfig) -> Res
     match adapter.name.as_str() {
         "mock" => Ok(middlesox_mock::create_backend()),
         "mangowc" => middlesox_mangowc::create_backend(),
-        "hyprland" => Err(anyhow!(
-            "Hyprland adapter is not yet implemented. \
-             Use the socket adapter with an external Hyprland bridge instead."
-        )),
+        "hyprland" => {
+            // Optional socket_dir override; otherwise discover from the
+            // HYPRLAND_INSTANCE_SIGNATURE environment
+            match adapter.options.get("socket_dir").and_then(|v| v.as_str()) {
+                Some(dir) => Ok(middlesox_hyprland::create_backend_with_socket_dir(dir)),
+                None => middlesox_hyprland::create_backend(),
+            }
+        }
         "socket" => {
             let (cmd_socket, event_socket) = socket_paths_from_options(&adapter.options)?;
             Ok(middlesox_socket::create_backend(cmd_socket, event_socket))

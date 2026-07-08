@@ -21,6 +21,7 @@ middlesox = { path = "middlesox" }
 middlesox-mock = { path = "mock" }
 middlesox-socket = { path = "socket" }
 middlesox-mangowc = { path = "mangowc" }
+middlesox-hyprland = { path = "hyprland" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

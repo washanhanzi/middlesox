@@ -13,6 +13,7 @@ middlesox.workspace = true
 middlesox-mock.workspace = true
 middlesox-socket.workspace = true
 middlesox-mangowc.workspace = true
+middlesox-hyprland.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

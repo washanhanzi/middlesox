@@ -62,4 +62,17 @@ if ! IFS= read -r -d "" wallpaper < <(
     exit 1
 fi
 
-awww img -o "$output" --transition-type none "$wallpaper"
+# awww-daemon may not be accepting connections yet right after login or
+# resume; retry briefly instead of failing on the first broken pipe.
+max_attempts=5
+for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if awww img -o "$output" --transition-type none "$wallpaper"; then
+        exit 0
+    fi
+    if ((attempt < max_attempts)); then
+        sleep 2
+    fi
+done
+
+echo "failed to set wallpaper after $max_attempts attempts" >&2
+exit 1

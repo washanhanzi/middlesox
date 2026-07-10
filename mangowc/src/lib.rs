@@ -774,7 +774,10 @@ impl Dispatch<ZdwlIpcOutputV2, u32> for WaylandState {
                             );
                         }
 
-                        if prev.title != pending_state.title || prev.appid != pending_state.appid {
+                        if output_name == state.state.focused_output
+                            && (prev.title != pending_state.title
+                                || prev.appid != pending_state.appid)
+                        {
                             state.emit_event(
                                 "focus_change",
                                 Some(

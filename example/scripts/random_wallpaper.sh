@@ -46,6 +46,32 @@ if ! command -v awww >/dev/null 2>&1; then
     exit 1
 fi
 
+wallpaper_delay_seconds="${MSX_WALLPAPER_DELAY_SECONDS:-0.20}"
+wallpaper_transition="${MSX_WALLPAPER_TRANSITION:-${AWWW_TRANSITION:-fade}}"
+wallpaper_transition_duration="${MSX_WALLPAPER_TRANSITION_DURATION:-${AWWW_TRANSITION_DURATION:-0.70}}"
+wallpaper_transition_fps="${MSX_WALLPAPER_TRANSITION_FPS:-${AWWW_TRANSITION_FPS:-60}}"
+tags="$(jq -r '.tags // empty' <<< "${MSX_CURR:-null}" 2>/dev/null || true)"
+
+if [[ -z "$tags" || "$tags" == "0" ]]; then
+    exit 0
+fi
+
+output_key="${output//[^A-Za-z0-9_.-]/_}"
+wallpaper_state_dir="${XDG_RUNTIME_DIR:-/tmp}/middlesox-wallpaper"
+
+if [[ "$wallpaper_delay_seconds" != "0" && "$wallpaper_delay_seconds" != "0.0" ]]; then
+    wallpaper_request_file="${wallpaper_state_dir}/random-${output_key}.request"
+    wallpaper_request_id="$$:${RANDOM}:$(date +%s%N)"
+
+    mkdir -p "$wallpaper_state_dir"
+    printf '%s\n' "$wallpaper_request_id" > "$wallpaper_request_file"
+    sleep "$wallpaper_delay_seconds"
+
+    if [[ "$(cat "$wallpaper_request_file" 2>/dev/null || true)" != "$wallpaper_request_id" ]]; then
+        exit 0
+    fi
+fi
+
 if ! IFS= read -r -d "" wallpaper < <(
     find "$wallpaper_dir" -type f \
         \( -iname "*.avif" \
@@ -66,7 +92,12 @@ fi
 # resume; retry briefly instead of failing on the first broken pipe.
 max_attempts=5
 for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-    if awww img -o "$output" --transition-type none "$wallpaper"; then
+    if awww img \
+        -o "$output" \
+        --transition-type "$wallpaper_transition" \
+        --transition-duration "$wallpaper_transition_duration" \
+        --transition-fps "$wallpaper_transition_fps" \
+        "$wallpaper"; then
         exit 0
     fi
     if ((attempt < max_attempts)); then
